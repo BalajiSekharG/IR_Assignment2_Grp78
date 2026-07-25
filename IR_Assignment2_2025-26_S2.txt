@@ -1,0 +1,95 @@
+ 
+Work Integrated Learning Programmes Division
+Information Retrieval (Merged - AIMLCZG537/DSECLZG537)(S2-25)
+Assignment - 2
+Marks = 15
+Objective
+This assignment is open-ended and does not prescribe a specific application domain or use case. Students are expected to choose a use case that is most relevant to their work, interests, or specific area of application. Students shall apply Information Retrieval concepts to any suitable dataset or collection, demonstrating the complete IR lifecycle while integrating the concepts mentioned below into a single, cohesive Streamlit-based system.
+1.	Task Breakdown
+Executing the Assignment on BITS Lab portal - 1 Mark
+A. Streamlit-Based End-to-End Workflow
+Develop a professional Streamlit application that includes:
+•	Dashboard 
+•	Search interface 
+•	Crawling interface 
+•	Index management 
+•	Ranking visualization 
+•	Recommendation panel 
+•	Evaluation dashboard 
+•	Performance analytics
+The complete workflow must be executable through the Streamlit front end only. Students should not show provide backend code or static notebook outputs.
+B.Requirements
+•  Acquire information from one or more heterogeneous sources through web crawling, publicly available datasets, APIs, or a combination of these. 
+•  Support configurable crawling depth and multiple seed sources. 
+•  Handle duplicate URLs and duplicate documents. 
+•  Store extracted metadata separately from document contents.
+
+
+
+
+C. Text Preprocessing and Mining
+•	Develop a scalable text mining framework that transforms raw textual data into structured feature representations through preprocessing, feature engineering, and statistical analysis.
+•	The framework should support keyword extraction, document profiling, document classification, comparative analysis of different preprocessing and feature extraction strategies. 
+•	Appropriate visualizations should be provided to interpret corpus characteristics, and feature distributions.
+D. Web Searching:
+•	Develop an intelligent web search module that supports diverse query processing, ranked document retrieval, and efficient search over indexed collections. 
+•	The system should provide relevant search results with appropriate metadata and incorporate advanced query optimization techniques wherever applicable.
+•	Use any of the algorithm (Page Rank/HITS) and display how ranking is important
+E. Recommender System
+Develop a recommendation module. The recommender should support one or more of the following:
+•	Content-based recommendation 
+•	Collaborative recommendation
+•	Hybrid recommendation
+Display Top-K recommendations together with similarity scores.
+F. Evaluate the effectiveness of the retrieval system using appropriate Information Retrieval metrics such as,
+•	Precision 
+•	Recall 
+•	F1-score 
+•	Precision@K 
+•	Recall@K 
+•	MAP 
+•	MRR 
+•	NDCG 
+Provide comparative analysis using tables and visualizations.
+G. Inference and Discussion *** This section is compulsory.***
+Students must provide clear inferences in the report for every task. You should answer: 
+
+1.   Suppose your system retrieves highly relevant documents but ranks them poorly. Identify the possible causes and propose improvements to the ranking strategy.
+2. If duplicate or near-duplicate documents exist in the corpus, how would they affect indexing, ranking, recommendation, and evaluation? Suggest methods to mitigate these effects.
+3. Compare the effectiveness of content-based recommendation and Collaborative -based recommendation in an Information Retrieval system. Under what scenarios would each approach be preferable?
+4.  Discuss how the integration of crawling, text mining, indexing, search, ranking, and recommendation contributes to the overall effectiveness of an end-to-end Information Retrieval system.
+ 5.    Based on the results obtained provide your learnings clearly.
+2.	Submission Components
+Students must submit:
+1.	Streamlit application code 
+o	.py file 
+o	Supporting files, if any 
+2.	Dataset used 
+o	Text documents, CSV, or any document collection 
+3.	Report 
+o	Explanation of implementation in the Virtual lab
+o	Screenshots of Streamlit front end (that you have worked in Virtual lab)
+o	Experimental results 
+o	Tables and inferences 
+o	Inference summary
+4.	Demo evidence 
+o	Screenshots or short screen recording of the application running 
+5.	README file 
+o	Steps to install dependencies 
+o	Command to run the app
+Example: streamlit run app.py
+3.	Rubric: 15 Marks
+Component	Marks
+Streamlit end-to-end workflow	2
+Text Preprocessing and Mining	2
+Web Searching	4
+Recommender Systems	2
+Evaluation Metrics	1.5
+Experimental evidence and inference	2.5
+Virtual lab usage	1
+Total	15
+
+For any other queries/ clarifications related to the assignment, please write on the Taxila Discussion Forum, after checking existing queries and their answers. 
+Submission Deadline – 22nd   August 23:59 PM
+This is a Hard Deadline - No extensions or late submissions will be allowed. All the Best !!
+
