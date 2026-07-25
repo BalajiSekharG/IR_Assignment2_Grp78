@@ -119,27 +119,33 @@ if page == "Dashboard":
     
     with col1:
         if st.button("Load Sample Data"):
+            import hashlib
             # Create sample documents
             sample_docs = [
                 {
                     'url': 'https://example.com/doc1',
-                    'content': 'Machine learning is a subset of artificial intelligence that focuses on algorithms that can learn from data. It includes supervised learning, unsupervised learning, and reinforcement learning techniques.'
+                    'content': 'Machine learning is a subset of artificial intelligence that focuses on algorithms that can learn from data. It includes supervised learning, unsupervised learning, and reinforcement learning techniques.',
+                    'hash': hashlib.md5('Machine learning is a subset of artificial intelligence that focuses on algorithms that can learn from data. It includes supervised learning, unsupervised learning, and reinforcement learning techniques.'.encode()).hexdigest()
                 },
                 {
                     'url': 'https://example.com/doc2',
-                    'content': 'Deep learning uses neural networks with multiple layers to model complex patterns in data. It has achieved remarkable success in image recognition, natural language processing, and speech recognition.'
+                    'content': 'Deep learning uses neural networks with multiple layers to model complex patterns in data. It has achieved remarkable success in image recognition, natural language processing, and speech recognition.',
+                    'hash': hashlib.md5('Deep learning uses neural networks with multiple layers to model complex patterns in data. It has achieved remarkable success in image recognition, natural language processing, and speech recognition.'.encode()).hexdigest()
                 },
                 {
                     'url': 'https://example.com/doc3',
-                    'content': 'Natural language processing enables computers to understand and generate human language. Applications include machine translation, sentiment analysis, and chatbots.'
+                    'content': 'Natural language processing enables computers to understand and generate human language. Applications include machine translation, sentiment analysis, and chatbots.',
+                    'hash': hashlib.md5('Natural language processing enables computers to understand and generate human language. Applications include machine translation, sentiment analysis, and chatbots.'.encode()).hexdigest()
                 },
                 {
                     'url': 'https://example.com/doc4',
-                    'content': 'Computer vision allows machines to interpret and understand visual information from the world. Key tasks include object detection, image classification, and facial recognition.'
+                    'content': 'Computer vision allows machines to interpret and understand visual information from the world. Key tasks include object detection, image classification, and facial recognition.',
+                    'hash': hashlib.md5('Computer vision allows machines to interpret and understand visual information from the world. Key tasks include object detection, image classification, and facial recognition.'.encode()).hexdigest()
                 },
                 {
                     'url': 'https://example.com/doc5',
-                    'content': 'Reinforcement learning trains agents to make decisions by rewarding desired behaviors. It has been successfully applied to game playing, robotics, and autonomous systems.'
+                    'content': 'Reinforcement learning trains agents to make decisions by rewarding desired behaviors. It has been successfully applied to game playing, robotics, and autonomous systems.',
+                    'hash': hashlib.md5('Reinforcement learning trains agents to make decisions by rewarding desired behaviors. It has been successfully applied to game playing, robotics, and autonomous systems.'.encode()).hexdigest()
                 }
             ]
             sample_metadata = [
@@ -263,7 +269,12 @@ elif page == "Web Crawling":
     if st.session_state.documents:
         st.subheader("Crawled Documents")
         doc_df = st.session_state.crawler.get_documents_dataframe()
-        st.dataframe(doc_df[['url', 'hash']], use_container_width=True)
+        # Display available columns
+        available_cols = [col for col in ['url', 'hash'] if col in doc_df.columns]
+        if available_cols:
+            st.dataframe(doc_df[available_cols], use_container_width=True)
+        else:
+            st.dataframe(doc_df, use_container_width=True)
 
 # Text Preprocessing Page
 elif page == "Text Preprocessing":
