@@ -20,18 +20,33 @@ class TextPreprocessor:
         
     def _download_nltk_data(self):
         """Download required NLTK data."""
+        # Try newer punkt_tab first, then fall back to punkt
         try:
-            nltk.data.find('tokenizers/punkt')
+            nltk.data.find('tokenizers/punkt_tab')
         except LookupError:
-            nltk.download('punkt', quiet=True)
+            try:
+                nltk.download('punkt_tab', quiet=True)
+            except:
+                try:
+                    nltk.data.find('tokenizers/punkt')
+                except LookupError:
+                    nltk.download('punkt', quiet=True)
+        
         try:
             nltk.data.find('corpora/stopwords')
         except LookupError:
             nltk.download('stopwords', quiet=True)
+        
         try:
             nltk.data.find('taggers/averaged_perceptron_tagger')
         except LookupError:
             nltk.download('averaged_perceptron_tagger', quiet=True)
+        
+        # Download wordnet for lemmatization
+        try:
+            nltk.data.find('corpora/wordnet')
+        except LookupError:
+            nltk.download('wordnet', quiet=True)
     
     def clean_text(self, text: str) -> str:
         """Basic text cleaning."""
