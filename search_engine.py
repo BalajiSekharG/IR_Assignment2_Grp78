@@ -30,26 +30,34 @@ class SearchEngine:
         if not os.path.exists(self.index_dir):
             os.makedirs(self.index_dir)
         
+        # Don't store full content to avoid serialization issues
         schema = Schema(
             url=ID(stored=True),
             title=TEXT(stored=True),
-            content=TEXT(stored=True),
+            content=TEXT(stored=False),  # Index but don't store
             doc_id=ID(stored=True)
         )
         
+        # Always create fresh index to avoid conflicts
         if exists_in(self.index_dir):
-            self.index = open_dir(self.index_dir)
-        else:
-            self.index = create_in(self.index_dir, schema)
+            # Remove existing index
+            import shutil
+            shutil.rmtree(self.index_dir)
+            os.makedirs(self.index_dir)
+        
+        self.index = create_in(self.index_dir, schema)
         
         writer = self.index.writer()
         
         for i, doc in enumerate(documents):
             title = metadata[i].get('title', '') if metadata and i < len(metadata) else ''
+            # Limit content size to avoid issues
+            content = doc['content'][:100000] if len(doc['content']) > 100000 else doc['content']
+            
             writer.add_document(
                 url=doc['url'],
-                title=title,
-                content=doc['content'],
+                title=title[:1000] if len(title) > 1000 else title,
+                content=content,
                 doc_id=str(i)
             )
         
@@ -127,13 +135,18 @@ class SearchEngine:
             base_score = hit.score
             pr_score = self.pagerank_scores.get(url, 0)
             combined_score = 0.7 * base_score + 0.3 * pr_score
+            
+            # Get content from original documents
+            doc = next((d for d in self.documents if d['url'] == url), None)
+            content = doc['content'][:500] + '...' if doc and len(doc['content']) > 500 else (doc['content'] if doc else '')
+            
             reranked.append({
                 'url': url,
                 'title': hit.get('title', ''),
                 'score': combined_score,
                 'original_score': base_score,
                 'pagerank_score': pr_score,
-                'content': hit.get('content', '')[:500] + '...' if len(hit.get('content', '')) > 500 else hit.get('content', '')
+                'content': content
             })
         
         reranked.sort(key=lambda x: x['score'], reverse=True)
@@ -149,13 +162,18 @@ class SearchEngine:
             base_score = hit.score
             auth_score = authorities.get(url, 0)
             combined_score = 0.7 * base_score + 0.3 * auth_score
+            
+            # Get content from original documents
+            doc = next((d for d in self.documents if d['url'] == url), None)
+            content = doc['content'][:500] + '...' if doc and len(doc['content']) > 500 else (doc['content'] if doc else '')
+            
             reranked.append({
                 'url': url,
                 'title': hit.get('title', ''),
                 'score': combined_score,
                 'original_score': base_score,
                 'authority_score': auth_score,
-                'content': hit.get('content', '')[:500] + '...' if len(hit.get('content', '')) > 500 else hit.get('content', '')
+                'content': content
             })
         
         reranked.sort(key=lambda x: x['score'], reverse=True)
@@ -165,11 +183,17 @@ class SearchEngine:
         """Format standard search results."""
         formatted = []
         for hit in results:
+            url = hit['url']
+            
+            # Get content from original documents
+            doc = next((d for d in self.documents if d['url'] == url), None)
+            content = doc['content'][:500] + '...' if doc and len(doc['content']) > 500 else (doc['content'] if doc else '')
+            
             formatted.append({
-                'url': hit['url'],
+                'url': url,
                 'title': hit.get('title', ''),
                 'score': hit.score,
-                'content': hit.get('content', '')[:500] + '...' if len(hit.get('content', '')) > 500 else hit.get('content', '')
+                'content': content
             })
         return formatted
     
@@ -187,12 +211,16 @@ class SearchEngine:
         if filters:
             filtered_results = []
             for hit in results:
+                url = hit['url']
+                doc = next((d for d in self.documents if d['url'] == url), None)
+                content = doc['content'] if doc else ''
+                
                 include = True
                 if 'min_length' in filters:
-                    if len(hit.get('content', '')) < filters['min_length']:
+                    if len(content) < filters['min_length']:
                         include = False
                 if 'must_contain' in filters:
-                    if filters['must_contain'].lower() not in hit.get('content', '').lower():
+                    if filters['must_contain'].lower() not in content.lower():
                         include = False
                 if include:
                     filtered_results.append(hit)
