@@ -21,7 +21,7 @@ class IREvaluation:
             query_id: Query identifier
             relevant_doc_ids: Set of relevant document IDs
         """
-        self.relevant_docs[query_id] = relevant_docs_ids if isinstance(relevant_doc_ids, set) else set(relevant_doc_ids)
+        self.relevant_docs[query_id] = relevant_doc_ids if isinstance(relevant_doc_ids, set) else set(relevant_doc_ids)
     
     def set_retrieved_documents(self, query_id: str, retrieved_doc_ids: List[str]):
         """
