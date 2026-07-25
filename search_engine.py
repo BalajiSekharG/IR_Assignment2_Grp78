@@ -1,69 +1,39 @@
 import numpy as np
 import networkx as nx
-from whoosh.index import create_in, exists_in, open_dir
-from whoosh.fields import Schema, TEXT, ID, STORED
-from whoosh.qparser import QueryParser, MultifieldParser
-from whoosh.query import Or, Term
-from whoosh import scoring
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 import os
 import json
 from typing import List, Dict, Tuple
-from sklearn.metrics.pairwise import cosine_similarity
 import plotly.graph_objects as go
 import plotly.express as px
 
 
 class SearchEngine:
-    def __init__(self, index_dir: str = "index_dir"):
-        self.index_dir = index_dir
-        self.index = None
-        self.searcher = None
+    def __init__(self):
         self.documents = []
         self.url_graph = {}
         self.pagerank_scores = {}
         self.hits_scores = {}
-        self.document_vectors = None
+        self.tfidf_vectorizer = None
         self.tfidf_matrix = None
+        self.processed_docs = []
         
-    def create_index(self, documents: List[Dict], metadata: List[Dict] = None):
-        """Create Whoosh index from documents."""
-        if not os.path.exists(self.index_dir):
-            os.makedirs(self.index_dir)
-        
-        # Don't store full content to avoid serialization issues
-        schema = Schema(
-            url=ID(stored=True),
-            title=TEXT(stored=True),
-            content=TEXT(stored=False),  # Index but don't store
-            doc_id=ID(stored=True)
-        )
-        
-        # Always create fresh index to avoid conflicts
-        if exists_in(self.index_dir):
-            # Remove existing index
-            import shutil
-            shutil.rmtree(self.index_dir)
-            os.makedirs(self.index_dir)
-        
-        self.index = create_in(self.index_dir, schema)
-        
-        writer = self.index.writer()
-        
-        for i, doc in enumerate(documents):
-            title = metadata[i].get('title', '') if metadata and i < len(metadata) else ''
-            # Limit content size to avoid issues
-            content = doc['content'][:100000] if len(doc['content']) > 100000 else doc['content']
-            
-            writer.add_document(
-                url=doc['url'],
-                title=title[:1000] if len(title) > 1000 else title,
-                content=content,
-                doc_id=str(i)
-            )
-        
-        writer.commit()
+    def create_index(self, documents: List[Dict], metadata: List[Dict] = None, processed_docs: List[str] = None):
+        """Create TF-IDF index from documents."""
         self.documents = documents
-        self.searcher = self.index.searcher()
+        
+        # Use processed docs if provided, otherwise use raw content
+        if processed_docs is None:
+            from text_preprocessing import TextPreprocessor
+            preprocessor = TextPreprocessor()
+            self.processed_docs = [preprocessor.preprocess_pipeline(doc['content']) for doc in documents]
+        else:
+            self.processed_docs = processed_docs
+        
+        # Create TF-IDF vectorizer
+        self.tfidf_vectorizer = TfidfVectorizer(max_features=5000, min_df=2, max_df=0.8)
+        self.tfidf_matrix = self.tfidf_vectorizer.fit_transform(self.processed_docs)
         
     def build_graph(self, url_graph: Dict[str, List[str]]):
         """Build graph structure from URL links."""
@@ -98,51 +68,56 @@ class SearchEngine:
             limit: Number of results to return
             ranking_method: 'tfidf', 'pagerank', or 'hits'
         """
-        if self.searcher is None:
-            self.searcher = self.index.searcher()
+        if self.tfidf_matrix is None:
+            return []
         
-        query_parser = MultifieldParser(['title', 'content'], self.index.schema)
-        parsed_query = query_parser.parse(query)
+        # Preprocess query
+        from text_preprocessing import TextPreprocessor
+        preprocessor = TextPreprocessor()
+        processed_query = preprocessor.preprocess_pipeline(query)
+        
+        # Transform query
+        query_vector = self.tfidf_vectorizer.transform([processed_query])
+        
+        # Calculate similarity
+        similarities = cosine_similarity(query_vector, self.tfidf_matrix)[0]
+        
+        # Get top results
+        top_indices = similarities.argsort()[::-1][:limit * 2]
+        
+        results = []
+        for idx in top_indices:
+            results.append({
+                'doc_id': idx,
+                'score': similarities[idx]
+            })
         
         if ranking_method == 'pagerank':
-            # Use custom weighting with PageRank
-            results = self.searcher.search(
-                parsed_query, 
-                limit=limit * 2,  # Get more results for re-ranking
-                scored=True
-            )
-            ranked_results = self._rerank_with_pagerank(results, limit)
+            return self._rerank_with_pagerank(results, limit)
         elif ranking_method == 'hits':
-            # Use custom weighting with HITS
-            results = self.searcher.search(
-                parsed_query,
-                limit=limit * 2,
-                scored=True
-            )
-            ranked_results = self._rerank_with_hits(results, limit)
+            return self._rerank_with_hits(results, limit)
         else:
-            # Standard TF-IDF ranking
-            results = self.searcher.search(parsed_query, limit=limit, scored=True)
-            ranked_results = self._format_results(results)
-        
-        return ranked_results
+            return self._format_results(results[:limit])
     
     def _rerank_with_pagerank(self, results, limit: int) -> List[Dict]:
         """Re-rank results using PageRank scores."""
         reranked = []
         for hit in results:
-            url = hit['url']
-            base_score = hit.score
+            doc_id = hit['doc_id']
+            if doc_id >= len(self.documents):
+                continue
+            
+            doc = self.documents[doc_id]
+            url = doc['url']
+            base_score = hit['score']
             pr_score = self.pagerank_scores.get(url, 0)
             combined_score = 0.7 * base_score + 0.3 * pr_score
             
-            # Get content from original documents
-            doc = next((d for d in self.documents if d['url'] == url), None)
-            content = doc['content'][:500] + '...' if doc and len(doc['content']) > 500 else (doc['content'] if doc else '')
+            content = doc['content'][:500] + '...' if len(doc['content']) > 500 else doc['content']
             
             reranked.append({
                 'url': url,
-                'title': hit.get('title', ''),
+                'title': '',
                 'score': combined_score,
                 'original_score': base_score,
                 'pagerank_score': pr_score,
@@ -158,18 +133,21 @@ class SearchEngine:
         authorities = self.hits_scores.get('authorities', {})
         
         for hit in results:
-            url = hit['url']
-            base_score = hit.score
+            doc_id = hit['doc_id']
+            if doc_id >= len(self.documents):
+                continue
+            
+            doc = self.documents[doc_id]
+            url = doc['url']
+            base_score = hit['score']
             auth_score = authorities.get(url, 0)
             combined_score = 0.7 * base_score + 0.3 * auth_score
             
-            # Get content from original documents
-            doc = next((d for d in self.documents if d['url'] == url), None)
-            content = doc['content'][:500] + '...' if doc and len(doc['content']) > 500 else (doc['content'] if doc else '')
+            content = doc['content'][:500] + '...' if len(doc['content']) > 500 else doc['content']
             
             reranked.append({
                 'url': url,
-                'title': hit.get('title', ''),
+                'title': '',
                 'score': combined_score,
                 'original_score': base_score,
                 'authority_score': auth_score,
@@ -183,37 +161,34 @@ class SearchEngine:
         """Format standard search results."""
         formatted = []
         for hit in results:
-            url = hit['url']
+            doc_id = hit['doc_id']
+            if doc_id >= len(self.documents):
+                continue
             
-            # Get content from original documents
-            doc = next((d for d in self.documents if d['url'] == url), None)
-            content = doc['content'][:500] + '...' if doc and len(doc['content']) > 500 else (doc['content'] if doc else '')
+            doc = self.documents[doc_id]
+            content = doc['content'][:500] + '...' if len(doc['content']) > 500 else doc['content']
             
             formatted.append({
-                'url': url,
-                'title': hit.get('title', ''),
-                'score': hit.score,
+                'url': doc['url'],
+                'title': '',
+                'score': hit['score'],
                 'content': content
             })
         return formatted
     
     def advanced_search(self, query: str, filters: Dict = None, limit: int = 10) -> List[Dict]:
         """Advanced search with filters."""
-        if self.searcher is None:
-            self.searcher = self.index.searcher()
-        
-        query_parser = MultifieldParser(['title', 'content'], self.index.schema)
-        parsed_query = query_parser.parse(query)
-        
-        results = self.searcher.search(parsed_query, limit=limit, scored=True)
+        results = self.search(query, limit=limit * 2)
         
         # Apply filters if provided
         if filters:
             filtered_results = []
-            for hit in results:
-                url = hit['url']
-                doc = next((d for d in self.documents if d['url'] == url), None)
-                content = doc['content'] if doc else ''
+            for result in results:
+                doc = next((d for d in self.documents if d['url'] == result['url']), None)
+                if not doc:
+                    continue
+                
+                content = doc['content']
                 
                 include = True
                 if 'min_length' in filters:
@@ -223,10 +198,12 @@ class SearchEngine:
                     if filters['must_contain'].lower() not in content.lower():
                         include = False
                 if include:
-                    filtered_results.append(hit)
-            results = filtered_results
+                    filtered_results.append(result)
+            results = filtered_results[:limit]
+        else:
+            results = results[:limit]
         
-        return self._format_results(results)
+        return results
     
     def visualize_pagerank_scores(self, top_n: int = 20) -> go.Figure:
         """Visualize top PageRank scores."""
@@ -344,6 +321,5 @@ class SearchEngine:
         return similarity
     
     def close(self):
-        """Close the searcher."""
-        if self.searcher:
-            self.searcher.close()
+        """No-op for TF-IDF based search."""
+        pass

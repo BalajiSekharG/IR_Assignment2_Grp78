@@ -365,9 +365,15 @@ elif page == "Index Management":
             st.subheader("Create Search Index")
             
             if st.button("Create/Rebuild Index"):
+                # Pass processed documents if available
+                processed_docs = None
+                if st.session_state.processed:
+                    processed_docs = st.session_state.text_mining.processed_docs
+                
                 st.session_state.search_engine.create_index(
                     st.session_state.documents,
-                    st.session_state.metadata
+                    st.session_state.metadata,
+                    processed_docs
                 )
                 st.session_state.indexed = True
                 st.success("Index created successfully!")
