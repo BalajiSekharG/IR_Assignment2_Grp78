@@ -2,6 +2,8 @@
 
 A comprehensive Streamlit-based Information Retrieval system implementing the complete IR lifecycle including web crawling, text preprocessing, indexing, search, ranking, recommendation, and evaluation.
 
+**Live Demo:** https://irassignment2grp78.streamlit.app/
+
 ## Features
 
 ### 1. Web Crawling
@@ -78,6 +80,8 @@ A comprehensive Streamlit-based Information Retrieval system implementing the co
    ```
 
 The application will automatically open in your default web browser at `http://localhost:8501`
+
+**Live Demo:** https://irassignment2grp78.streamlit.app/
 
 ## Dependencies
 
@@ -317,6 +321,8 @@ This project includes all required submission components:
 3. ✅ Report (comprehensive README with implementation details)
 4. ✅ Demo evidence (screenshots can be captured from running app)
 5. ✅ README file (this document with setup instructions)
+
+**Live Demo URL:** https://irassignment2grp78.streamlit.app/
 
 ## License
 
