@@ -183,9 +183,12 @@ if page == "Dashboard":
     with col3:
         if st.button("Create Index"):
             if st.session_state.documents and st.session_state.processed:
+                # Pass processed documents to search engine
+                processed_docs = st.session_state.text_mining.processed_docs
                 st.session_state.search_engine.create_index(
                     st.session_state.documents,
-                    st.session_state.metadata
+                    st.session_state.metadata,
+                    processed_docs
                 )
                 if st.session_state.url_graph:
                     G = st.session_state.search_engine.build_graph(st.session_state.url_graph)
@@ -194,7 +197,7 @@ if page == "Dashboard":
                 st.success("Index created successfully!")
                 st.rerun()
             else:
-                st.error("Process documents first!")
+                st.error("Please load and process documents first!")
 
 # Web Crawling Page
 elif page == "Web Crawling":
