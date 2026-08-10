@@ -11,17 +11,48 @@ class IREvaluation:
     def __init__(self):
         self.relevant_docs = {}
         self.retrieved_docs = {}
+        self.graded_relevance = {}
+        self.query_texts = {}
         self.results = {}
         
-    def set_relevant_documents(self, query_id: str, relevant_doc_ids: Set[str]):
+    def set_relevant_documents(self, query_id: str, relevant_doc_ids: Set[str],
+                                query_text: str = None,
+                                graded_relevance: Dict[str, int] = None):
         """
         Set relevant documents for a query.
-        
+
         Args:
             query_id: Query identifier
             relevant_doc_ids: Set of relevant document IDs
+            query_text: The actual query string, needed to run the search later
+            graded_relevance: Optional doc_id -> relevance grade mapping
         """
-        self.relevant_docs[query_id] = relevant_doc_ids if isinstance(relevant_doc_ids, set) else set(relevant_doc_ids)
+        self.relevant_docs[query_id] = (
+            relevant_doc_ids if isinstance(relevant_doc_ids, set) else set(relevant_doc_ids)
+        )
+        if query_text is not None:
+            self.query_texts[query_id] = query_text
+        if graded_relevance:
+            self.graded_relevance[query_id] = {str(k): v for k, v in graded_relevance.items()}
+
+    def get_query_text(self, query_id: str) -> str:
+        """Return the stored query string for a query id."""
+        return self.query_texts.get(query_id, '')
+
+    def _grade(self, query_id: str, doc_id: str) -> float:
+        """Relevance grade of a document, defaulting to binary relevance."""
+        grades = self.graded_relevance.get(query_id)
+        if grades is not None:
+            return float(grades.get(str(doc_id), 0))
+        return 1.0 if doc_id in self.relevant_docs.get(query_id, set()) else 0.0
+
+    def reset(self):
+        """Clear all judgements and runs."""
+        self.relevant_docs.clear()
+        self.retrieved_docs.clear()
+        self.graded_relevance.clear()
+        self.query_texts.clear()
+        self.results.clear()
     
     def set_retrieved_documents(self, query_id: str, retrieved_doc_ids: List[str]):
         """
@@ -240,11 +271,10 @@ class IREvaluation:
             return 0.0
         
         retrieved = self.retrieved_docs[query_id][:k]
-        relevant = self.relevant_docs[query_id]
         
         dcg = 0.0
         for i, doc_id in enumerate(retrieved):
-            relevance = 1 if doc_id in relevant else 0
+            relevance = self._grade(query_id, doc_id)
             dcg += relevance / np.log2(i + 2)  # i+2 because log2(1) = 0
         
         return dcg
@@ -260,16 +290,20 @@ class IREvaluation:
         Returns:
             NDCG@K score
         """
+        # Guard: the ideal ranking cannot be built without judgements.
+        if query_id not in self.relevant_docs:
+            return 0.0
+
         dcg = self.dcg_at_k(query_id, k)
-        
-        # Calculate ideal DCG
-        relevant = self.relevant_docs[query_id]
-        ideal_retrieved = list(relevant)[:k]
-        
-        idcg = 0.0
-        for i in range(min(k, len(ideal_retrieved))):
-            idcg += 1 / np.log2(i + 2)
-        
+
+        # Ideal DCG places the highest graded documents first.
+        ideal_grades = sorted(
+            (self._grade(query_id, doc_id) for doc_id in self.relevant_docs[query_id]),
+            reverse=True
+        )[:k]
+
+        idcg = sum(grade / np.log2(i + 2) for i, grade in enumerate(ideal_grades))
+
         return dcg / idcg if idcg > 0 else 0.0
     
     def mean_ndcg_at_k(self, k: int, query_ids: List[str] = None) -> float:
@@ -355,9 +389,18 @@ class IREvaluation:
         for qid in query_ids:
             metrics = self.calculate_all_metrics(qid, k_values)
             metrics['query_id'] = qid
+            metrics['query_text'] = self.query_texts.get(qid, '')
+            metrics['relevant_documents'] = len(self.relevant_docs.get(qid, set()))
+            metrics['retrieved_documents'] = len(self.retrieved_docs.get(qid, []))
             all_metrics.append(metrics)
         
-        return pd.DataFrame(all_metrics)
+        frame = pd.DataFrame(all_metrics)
+        if frame.empty:
+            return frame
+
+        leading = ['query_id', 'query_text', 'relevant_documents', 'retrieved_documents']
+        ordered = leading + [c for c in frame.columns if c not in leading]
+        return frame[ordered]
     
     def visualize_precision_recall_curve(self, query_id: str) -> go.Figure:
         """
@@ -489,6 +532,63 @@ class IREvaluation:
             self.retrieved_docs = original_retrieved
         
         return pd.DataFrame(comparison)
+    
+    def evaluate_search_engine(self, search_engine, methods: List[str] = None,
+                                limit: int = 10, link_weight: float = 0.3,
+                                expand: bool = False,
+                                k_values: List[int] = [5, 10, 20]) -> pd.DataFrame:
+        """Run every judged query through the search engine and score the runs.
+
+        For each ranking method the retrieved ``doc_id`` values are recorded, so
+        the metrics compare judged document identities against retrieved
+        document identities (never against rank positions).
+        """
+        if methods is None:
+            methods = ['tfidf', 'bm25', 'pagerank', 'hits']
+
+        rows = []
+        self.results = {}
+
+        for method in methods:
+            runs = {}
+            latencies = []
+
+            for query_id in self.relevant_docs:
+                query_text = self.query_texts.get(query_id)
+                if not query_text:
+                    continue
+
+                results = search_engine.search(
+                    query=query_text, limit=limit,
+                    ranking_method=method, link_weight=link_weight,
+                    expand=expand)
+                runs[query_id] = [str(result['doc_id']) for result in results]
+                latencies.append(search_engine.last_query_info.get('latency_ms', 0))
+
+            previous = self.retrieved_docs
+            self.retrieved_docs = runs
+            metrics = self.calculate_system_metrics(k_values)
+            per_query = self.get_per_query_metrics(k_values)
+            self.results[method] = {'runs': runs, 'per_query': per_query}
+            self.retrieved_docs = previous
+
+            metrics['method'] = method
+            metrics['queries_evaluated'] = len(runs)
+            metrics['avg_latency_ms'] = round(float(np.mean(latencies)), 2) if latencies else 0.0
+            rows.append(metrics)
+
+        frame = pd.DataFrame(rows)
+        if frame.empty:
+            return frame
+
+        leading = ['method', 'queries_evaluated', 'map', 'mrr']
+        ordered = leading + [c for c in frame.columns if c not in leading]
+        return frame[ordered]
+
+    def apply_run(self, method: str):
+        """Make a stored run from ``evaluate_search_engine`` the active run."""
+        if method in self.results:
+            self.retrieved_docs = dict(self.results[method]['runs'])
     
     def visualize_method_comparison(self, comparison_df: pd.DataFrame) -> go.Figure:
         """

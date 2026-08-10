@@ -5,18 +5,28 @@ import hashlib
 import json
 import time
 from collections import deque
-from typing import List, Dict, Set
+from typing import List, Dict, Set, Tuple
 import pandas as pd
 from datetime import datetime
 
 
 class WebCrawler:
-    def __init__(self):
+    # A single edited word invalidates ``shingle_size`` shingles, so on
+    # short documents even a two-word paraphrase drops Jaccard similarity to ~
+    # 0.79.
+    # 0.75 is the usual operating point for near-duplicate detection and is
+    # still far above the similarity of genuinely distinct documents (< 0.1).
+    def __init__(self, shingle_size: int = 5, near_duplicate_threshold: float = 0.75):
         self.visited_urls: Set[str] = set()
         self.document_hashes: Set[str] = set()
         self.documents: List[Dict] = []
         self.metadata: List[Dict] = []
         self.url_graph: Dict[str, List[str]] = {}
+        self.shingle_size = shingle_size
+        self.near_duplicate_threshold = near_duplicate_threshold
+        self.document_shingles: List[Set[int]] = []
+        self.duplicate_report: List[Dict] = []
+        self.last_stats: Dict = {}
         
     def _get_domain(self, url: str) -> str:
         """Extract domain from URL."""
@@ -49,13 +59,20 @@ class WebCrawler:
             normalized = normalized._replace(path=normalized.path.rstrip('/'))
         return normalized.geturl()
     
-    def _extract_links(self, soup: BeautifulSoup, base_url: str) -> List[str]:
-        """Extract all links from a page."""
+    def _extract_links(self, soup: BeautifulSoup, base_url: str,
+                        base_domain: str = None) -> List[str]:
+        """Extract all links from a page, honouring the domain restriction."""
         links = []
+        seen = set()
         for link in soup.find_all('a', href=True):
             absolute_url = urljoin(base_url, link['href'])
-            if self._is_valid_url(absolute_url):
-                links.append(self._normalize_url(absolute_url))
+            # base_domain must be forwarded here, otherwise the
+            # "stay on domain" option has no effect at all.
+            if self._is_valid_url(absolute_url, base_domain):
+                normalized = self._normalize_url(absolute_url)
+                if normalized not in seen:
+                    seen.add(normalized)
+                    links.append(normalized)
         return links
     
     def _extract_content(self, soup: BeautifulSoup) -> str:
@@ -98,11 +115,55 @@ class WebCrawler:
         return metadata
     
     def _compute_hash(self, content: str) -> str:
-        """Compute hash of content for duplicate detection."""
+        """Compute hash of content for exact duplicate detection."""
         return hashlib.md5(content.encode()).hexdigest()
+
+    def _compute_shingles(self, content: str) -> Set[int]:
+        """Compute the set of hashed word w-shingles for a document.
+
+        Exact hashing only catches byte-identical pages. Shingling captures
+        local word order, so lightly edited mirrors (different boilerplate,
+        a changed sentence) still overlap heavily and can be detected with
+        Jaccard similarity.
+        """
+        words = content.lower().split()
+        size = self.shingle_size
+        if len(words) < size:
+            return {hash(' '.join(words))} if words else set()
+        return {
+            hash(' '.join(words[i:i + size]))
+            for i in range(len(words) - size + 1)
+        }
+
+    @staticmethod
+    def _jaccard(left: Set[int], right: Set[int]) -> float:
+        """Jaccard similarity between two shingle sets."""
+        if not left or not right:
+            return 0.0
+        intersection = len(left & right)
+        union = len(left | right)
+        return intersection / union if union else 0.0
+
+    def find_near_duplicate(self, content: str) -> Tuple[int, float]:
+        """Return (index, similarity) of the closest stored near-duplicate.
+
+        Returns ``(-1, best_similarity)`` when nothing crosses the threshold.
+        """
+        shingles = self._compute_shingles(content)
+        best_index, best_similarity = -1, 0.0
+
+        for index, existing in enumerate(self.document_shingles):
+            similarity = self._jaccard(shingles, existing)
+            if similarity > best_similarity:
+                best_index, best_similarity = index, similarity
+
+        if best_similarity >= self.near_duplicate_threshold:
+            return best_index, best_similarity
+        return -1, best_similarity
     
     def crawl(self, seed_urls: List[str], max_depth: int = 2, max_pages: int = 100, 
-              stay_on_domain: bool = True) -> Dict:
+              stay_on_domain: bool = True, delay: float = 0.5,
+              detect_near_duplicates: bool = True) -> Dict:
         """
         Crawl web pages starting from seed URLs.
         
@@ -110,37 +171,53 @@ class WebCrawler:
             seed_urls: List of starting URLs
             max_depth: Maximum depth to crawl
             max_pages: Maximum number of pages to crawl
-            stay_on_domain: Whether to stay on the same domain as seed URLs
+            stay_on_domain: Whether to stay on the domains of the seed URLs
+            delay: Politeness delay between requests, in seconds
+            detect_near_duplicates: Enable shingle-based near-duplicate removal
         
         Returns:
             Dictionary with crawl statistics
         """
+        started = time.perf_counter()
+
         self.visited_urls.clear()
         self.document_hashes.clear()
         self.documents.clear()
         self.metadata.clear()
         self.url_graph.clear()
+        self.document_shingles.clear()
+        self.duplicate_report.clear()
         
         queue = deque()
-        base_domain = None
+        seed_domains = set()
+        urls_discovered = 0
         
-        # Initialize queue with seed URLs
+        # Initialize queue with seed URLs. Every seed contributes its domain,
+        # so multiple heterogeneous seed sources are supported.
         for seed_url in seed_urls:
             if self._is_valid_url(seed_url):
                 normalized_url = self._normalize_url(seed_url)
                 queue.append((normalized_url, 0))
-                if stay_on_domain and base_domain is None:
-                    base_domain = self._get_domain(normalized_url)
+                urls_discovered += 1
+                seed_domains.add(self._get_domain(normalized_url))
         
         pages_crawled = 0
         duplicate_urls = 0
-        duplicate_documents = 0
+        depth_limited = 0
+        exact_duplicates = 0
+        near_duplicates = 0
+        fetch_errors = 0
         
         while queue and pages_crawled < max_pages:
             url, depth = queue.popleft()
             
-            if url in self.visited_urls or depth > max_depth:
+            # Distinct counters: an already-visited URL is a duplicate URL,
+            # whereas a URL beyond max_depth was simply not explored.
+            if url in self.visited_urls:
                 duplicate_urls += 1
+                continue
+            if depth > max_depth:
+                depth_limited += 1
                 continue
             
             self.visited_urls.add(url)
@@ -150,6 +227,7 @@ class WebCrawler:
                 response = requests.get(url, headers=headers, timeout=10)
                 
                 if response.status_code != 200:
+                    fetch_errors += 1
                     continue
                 
                 soup = BeautifulSoup(response.content, 'lxml')
@@ -158,47 +236,158 @@ class WebCrawler:
                 content = self._extract_content(soup)
                 metadata = self._extract_metadata(soup, url)
                 
-                # Check for duplicate content
-                content_hash = self._compute_hash(content)
-                if content_hash in self.document_hashes:
-                    duplicate_documents += 1
+                if not content.strip():
+                    fetch_errors += 1
                     continue
                 
-                self.document_hashes.add(content_hash)
+                # Exact duplicate detection via content hash
+                content_hash = self._compute_hash(content)
+                if content_hash in self.document_hashes:
+                    exact_duplicates += 1
+                    self.duplicate_report.append({
+                        'url': url, 'type': 'exact duplicate',
+                        'similarity': 1.0, 'matched_document': None
+                    })
+                    continue
                 
-                # Store document
+                # Near-duplicate detection via shingle Jaccard similarity
+                if detect_near_duplicates:
+                    match_index, similarity = self.find_near_duplicate(content)
+                    if match_index >= 0:
+                        near_duplicates += 1
+                        self.duplicate_report.append({
+                            'url': url, 'type': 'near duplicate',
+                            'similarity': round(similarity, 3),
+                            'matched_document': self.documents[match_index]['url']
+                        })
+                        continue
+                
+                self.document_hashes.add(content_hash)
+                self.document_shingles.append(self._compute_shingles(content))
+                
+                # Store document content separately from its metadata
                 self.documents.append({
+                    'doc_id': len(self.documents),
                     'url': url,
                     'content': content,
                     'hash': content_hash
                 })
                 
-                # Store metadata
+                metadata['doc_id'] = len(self.documents) - 1
+                metadata['depth'] = depth
+                metadata['word_count'] = len(content.split())
                 self.metadata.append(metadata)
                 
-                # Extract links and build graph
-                links = self._extract_links(soup, url)
+                # Extract links and build graph (domain restriction applied)
+                links = self._extract_links(soup, url, base_domain=None if not stay_on_domain else self._get_domain(url))
+                if stay_on_domain:
+                    links = [link for link in links if self._get_domain(link) in seed_domains]
                 self.url_graph[url] = links
                 
                 # Add new links to queue
                 for link in links:
                     if link not in self.visited_urls:
                         queue.append((link, depth + 1))
+                        urls_discovered += 1
                 
                 pages_crawled += 1
-                time.sleep(0.5)  # Be polite to servers
+                if delay:
+                    time.sleep(delay)  # Be polite to servers
                 
             except Exception as e:
+                fetch_errors += 1
                 print(f"Error crawling {url}: {e}")
                 continue
         
-        return {
+        elapsed = time.perf_counter() - started
+        self.last_stats = {
             'pages_crawled': pages_crawled,
+            'seed_urls': len(seed_urls),
+            'seed_domains': sorted(seed_domains),
+            'max_depth': max_depth,
+            'urls_discovered': urls_discovered,
+            'unique_urls_visited': len(self.visited_urls),
             'duplicate_urls_skipped': duplicate_urls,
-            'duplicate_documents_skipped': duplicate_documents,
-            'total_urls_found': len(self.visited_urls),
-            'graph_edges': sum(len(links) for links in self.url_graph.values())
+            'depth_limited_urls': depth_limited,
+            'duplicate_documents_skipped': exact_duplicates,
+            'near_duplicate_documents_skipped': near_duplicates,
+            'fetch_errors': fetch_errors,
+            'graph_edges': sum(len(links) for links in self.url_graph.values()),
+            'crawl_seconds': round(elapsed, 2),
+            'pages_per_second': round(pages_crawled / elapsed, 2) if elapsed > 0 else 0
         }
+        return self.last_stats
+    
+    def add_documents(self, documents: List[Dict], metadata: List[Dict] = None,
+                        detect_near_duplicates: bool = True) -> Dict:
+        """Ingest documents from a non-crawled source (dataset, API, upload).
+
+        Applies the same duplicate and near-duplicate policy as the crawler so
+        that heterogeneous sources can be combined into one clean collection.
+        """
+        added = 0
+        exact_duplicates = 0
+        near_duplicates = 0
+
+        for i, doc in enumerate(documents):
+            content = doc.get('content', '')
+            if not content.strip():
+                continue
+
+            url = doc.get('url', f'local://document/{i}')
+            if url in self.visited_urls:
+                continue
+
+            content_hash = doc.get('hash') or self._compute_hash(content)
+            if content_hash in self.document_hashes:
+                exact_duplicates += 1
+                self.duplicate_report.append({
+                    'url': url, 'type': 'exact duplicate',
+                    'similarity': 1.0, 'matched_document': None
+                })
+                continue
+
+            if detect_near_duplicates:
+                match_index, similarity = self.find_near_duplicate(content)
+                if match_index >= 0:
+                    near_duplicates += 1
+                    self.duplicate_report.append({
+                        'url': url, 'type': 'near duplicate',
+                        'similarity': round(similarity, 3),
+                        'matched_document': self.documents[match_index]['url']
+                    })
+                    continue
+
+            self.visited_urls.add(url)
+            self.document_hashes.add(content_hash)
+            self.document_shingles.append(self._compute_shingles(content))
+            self.documents.append({
+                'doc_id': len(self.documents),
+                'url': url,
+                'content': content,
+                'hash': content_hash
+            })
+
+            record = dict(metadata[i]) if metadata and i < len(metadata) else {'url': url}
+            record.setdefault('url', url)
+            record['doc_id'] = len(self.documents) - 1
+            record.setdefault('word_count', len(content.split()))
+            record.setdefault('crawl_date', datetime.now().isoformat(timespec='seconds'))
+            self.metadata.append(record)
+            added += 1
+
+        return {
+            'documents_added': added,
+            'duplicate_documents_skipped': exact_duplicates,
+            'near_duplicate_documents_skipped': near_duplicates,
+            'total_documents': len(self.documents)
+        }
+
+    def get_duplicate_report(self) -> pd.DataFrame:
+        """Return the duplicate / near-duplicate decisions as a table."""
+        if not self.duplicate_report:
+            return pd.DataFrame(columns=['url', 'type', 'similarity', 'matched_document'])
+        return pd.DataFrame(self.duplicate_report)
     
     def save_documents(self, filepath: str):
         """Save crawled documents to JSON file."""
