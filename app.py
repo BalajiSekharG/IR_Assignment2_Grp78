@@ -284,7 +284,7 @@ if page == "Dashboard":
         
         # Load bundled queries for evaluation
         for qid, qdata in BUNDLED_QUERIES.items():
-            st.session_state.evaluator.query_text[qid] = qdata['query_text']
+            st.session_state.evaluator.query_texts[qid] = qdata['query_text']
             st.session_state.evaluator.relevant_docs[qid] = set(qdata['relevant_doc_ids'])
             if 'graded_relevance' in qdata:
                 st.session_state.evaluator.graded_relevance[qid] = qdata['graded_relevance']
@@ -1006,14 +1006,14 @@ elif page == "Evaluation Dashboard":
             if st.session_state.evaluator.relevant_docs:
                 st.write("Existing ground truth:")
                 for qid, rel_docs in st.session_state.evaluator.relevant_docs.items():
-                    qtext = st.session_state.evaluator.query_text.get(qid, qid)
+                    qtext = st.session_state.evaluator.query_texts.get(qid, qid)
                     graded = st.session_state.evaluator.graded_relevance.get(qid, {})
                     st.write(f"**{qid}**: '{qtext}' - {len(rel_docs)} relevant docs (graded: {len(graded)})")
             
             # Load bundled judgments
             if st.button("Load bundled judgments"):
                 for qid, qdata in BUNDLED_QUERIES.items():
-                    st.session_state.evaluator.query_text[qid] = qdata['query_text']
+                    st.session_state.evaluator.query_texts[qid] = qdata['query_text']
                     st.session_state.evaluator.relevant_docs[qid] = set(qdata['relevant_doc_ids'])
                     if 'graded_relevance' in qdata:
                         st.session_state.evaluator.graded_relevance[qid] = qdata['graded_relevance']
@@ -1023,7 +1023,7 @@ elif page == "Evaluation Dashboard":
             # Clear all judgments
             if st.button("Clear all judgments"):
                 st.session_state.evaluator.relevant_docs = {}
-                st.session_state.evaluator.query_text = {}
+                st.session_state.evaluator.query_texts = {}
                 st.session_state.evaluator.graded_relevance = {}
                 st.success("All judgments cleared")
                 st.rerun()
@@ -1040,7 +1040,7 @@ elif page == "Evaluation Dashboard":
                 
                 if st.button("Save query"):
                     if new_qid and new_qtext:
-                        st.session_state.evaluator.query_text[new_qid] = new_qtext
+                        st.session_state.evaluator.query_texts[new_qid] = new_qtext
                         st.session_state.evaluator.relevant_docs[new_qid] = set(new_rel_docs)
                         st.success(f"Query {new_qid} saved")
                         st.rerun()
@@ -1063,7 +1063,7 @@ elif page == "Evaluation Dashboard":
                         method_metrics = {'method': method}
                         
                         for qid in st.session_state.evaluator.relevant_docs:
-                            qtext = st.session_state.evaluator.query_text.get(qid, qid)
+                            qtext = st.session_state.evaluator.query_texts.get(qid, qid)
                             
                             # Run search
                             results = st.session_state.search_engine.search(
@@ -1119,7 +1119,7 @@ elif page == "Evaluation Dashboard":
                 method = st.selectbox("Select ranking method", ["tfidf", "bm25", "pagerank", "hits", "hybrid"])
                 
                 if st.button("Analyze"):
-                    qtext = st.session_state.evaluator.query_text.get(query_id, query_id)
+                    qtext = st.session_state.evaluator.query_texts.get(query_id, query_id)
                     
                     # Run search
                     results = st.session_state.search_engine.search(
