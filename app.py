@@ -1,10 +1,13 @@
 import streamlit as st
 import pandas as pd
+import plotly.express as px
 import plotly.graph_objects as go
 import os
 import json
-from datetime import datetime
+import time
+import numpy as np
 import networkx as nx
+from datetime import datetime
 
 # Import our modules
 from web_crawler import WebCrawler
@@ -12,6 +15,7 @@ from text_preprocessing import TextMiningFramework
 from search_engine import SearchEngine
 from recommender_system import RecommenderSystem
 from evaluation_metrics import IREvaluation
+from sample_data import BUNDLED_DATASET, BUNDLED_METADATA, BUNDLED_URL_GRAPH, BUNDLED_LABELS, BUNDLED_RATINGS, BUNDLED_QUERIES
 
 # Page configuration
 st.set_page_config(
@@ -31,24 +35,10 @@ st.markdown("""
         text-align: center;
         margin-bottom: 2rem;
     }
-    .metric-card {
-        background-color: #f0f2f6;
-        padding: 1rem;
-        border-radius: 0.5rem;
-        margin: 0.5rem 0;
-    }
-    .success-message {
-        color: #2ecc71;
-        font-weight: bold;
-    }
-    .warning-message {
-        color: #f39c12;
-        font-weight: bold;
-    }
 </style>
 """, unsafe_allow_html=True)
 
-# Initialize session state
+# Initialize session state with default objects
 if 'crawler' not in st.session_state:
     st.session_state.crawler = WebCrawler()
 if 'text_mining' not in st.session_state:
@@ -69,635 +59,1370 @@ if 'indexed' not in st.session_state:
     st.session_state.indexed = False
 if 'processed' not in st.session_state:
     st.session_state.processed = False
+if 'query_log' not in st.session_state:
+    st.session_state.query_log = []
+if 'method_comparison' not in st.session_state:
+    st.session_state.method_comparison = None
+
+# Helper functions
+def invalidate_downstream():
+    """Invalidate downstream stages when upstream changes."""
+    st.session_state.processed = False
+    st.session_state.indexed = False
+    st.session_state.method_comparison = None
+
+def sync_collection_from_crawler():
+    """Sync session state from crawler after a crawl."""
+    st.session_state.documents = st.session_state.crawler.documents
+    st.session_state.metadata = st.session_state.crawler.metadata
+    st.session_state.url_graph = st.session_state.crawler.url_graph
+    invalidate_downstream()
+
+def metadata_lookup(url):
+    """Look up metadata for a URL."""
+    for m in st.session_state.metadata:
+        if m.get('url') == url:
+            return m
+    return {}
+
+def title_for(doc_id):
+    """Get title for a document ID."""
+    if 0 <= doc_id < len(st.session_state.documents):
+        url = st.session_state.documents[doc_id].get('url', '')
+        meta = metadata_lookup(url)
+        return meta.get('title', url)
+    return str(doc_id)
+
+def document_options():
+    """Generate document options for selectbox."""
+    return [f"{i}: {title_for(i)}" for i in range(len(st.session_state.documents))]
+
+def describe_document(doc_id):
+    """Generate a description for a document."""
+    if 0 <= doc_id < len(st.session_state.documents):
+        doc = st.session_state.documents[doc_id]
+        meta = metadata_lookup(doc.get('url', ''))
+        return f"{meta.get('title', doc.get('url', ''))} ({len(doc.get('content', ''))} chars)"
+    return "Unknown document"
+
+def load_bundled_dataset(include_near_duplicates=False):
+    """Load the bundled dataset into session state."""
+    st.session_state.documents = BUNDLED_DATASET.copy()
+    st.session_state.metadata = BUNDLED_METADATA.copy()
+    st.session_state.url_graph = BUNDLED_URL_GRAPH.copy()
+    
+    if not include_near_duplicates:
+        # Filter out near duplicates
+        near_dup_urls = set()
+        for i, doc in enumerate(st.session_state.documents):
+            if doc.get('near_duplicate', False):
+                near_dup_urls.add(doc.get('url', ''))
+        
+        st.session_state.documents = [d for d in st.session_state.documents if d.get('url', '') not in near_dup_urls]
+        st.session_state.metadata = [m for m in st.session_state.metadata if m.get('url', '') not in near_dup_urls]
+        
+        # Clean up URL graph
+        for url in near_dup_urls:
+            st.session_state.url_graph.pop(url, None)
+        for url in st.session_state.url_graph:
+            st.session_state.url_graph[url] = [u for u in st.session_state.url_graph[url] if u not in near_dup_urls]
+    
+    invalidate_downstream()
+
+def run_preprocessing(remove_stops, lemmatize, stem, max_features, ngram_max):
+    """Run text preprocessing with given parameters."""
+    st.session_state.text_mining.load_documents(st.session_state.documents)
+    st.session_state.text_mining.extract_tfidf_features(
+        remove_stopwords=remove_stops,
+        lemmatize=lemmatize,
+        stem=stem,
+        max_features=max_features,
+        ngram_range=(1, ngram_max)
+    )
+    st.session_state.processed = True
+    st.session_state.indexed = False
+    st.session_state.method_comparison = None
+
+def build_index():
+    """Build the search index."""
+    processed_docs = None
+    if st.session_state.processed:
+        processed_docs = st.session_state.text_mining.processed_docs
+    
+    st.session_state.search_engine.create_index(
+        st.session_state.documents,
+        st.session_state.metadata,
+        processed_docs
+    )
+    st.session_state.indexed = True
+
+def build_link_graph():
+    """Build the URL graph and compute link analysis."""
+    if st.session_state.url_graph:
+        G = st.session_state.search_engine.build_graph(st.session_state.url_graph)
+        st.session_state.search_engine.calculate_pagerank(G)
+        st.session_state.search_engine.calculate_hits(G)
+
+def build_recommender():
+    """Build the recommender system."""
+    if st.session_state.documents:
+        st.session_state.recommender.fit(st.session_state.documents)
+
+def log_query(query, results, latency_ms, method):
+    """Log a query for analytics."""
+    st.session_state.query_log.append({
+        'timestamp': datetime.now(),
+        'query': query,
+        'results': len(results),
+        'latency_ms': latency_ms,
+        'method': method
+    })
+
+def results_table(results):
+    """Convert results to a dataframe for display."""
+    data = []
+    for i, r in enumerate(results, 1):
+        data.append({
+            'rank': i,
+            'title': r.get('title', r.get('url', ''))[:50],
+            'url': r.get('url', ''),
+            'score': f"{r.get('score', 0):.4f}"
+        })
+    return pd.DataFrame(data)
+
+def stage_badge(complete, label):
+    """Render a badge for a pipeline stage."""
+    if complete:
+        return f"✅ {label}"
+    else:
+        return f"⭕ {label}"
 
 # Sidebar navigation
 st.sidebar.title("Navigation")
 page = st.sidebar.radio(
     "Select a page:",
-    ["Dashboard", "Web Crawling", "Text Preprocessing", "Index Management", 
-     "Web Search", "Ranking Visualization", "Recommendation Panel", 
-     "Evaluation Dashboard", "Performance Analytics"]
+    ["Dashboard", "Data Acquisition", "Text Preprocessing & Mining", "Index Management", 
+     "Search Interface", "Ranking Visualization", "Recommendation Panel", 
+     "Evaluation Dashboard", "Performance Analytics", "Inference & Discussion"]
 )
 
+# Pipeline status in sidebar
+st.sidebar.markdown("---")
+st.sidebar.subheader("Pipeline Status")
+st.sidebar.write(stage_badge(bool(st.session_state.documents), "Documents loaded"))
+st.sidebar.write(stage_badge(st.session_state.processed, "Text processed"))
+st.sidebar.write(stage_badge(st.session_state.indexed, "Index built"))
+
 # Main header
-st.markdown('<h1 class="main-header">Information Retrieval System</h1>', unsafe_allow_html=True)
+st.markdown('<h1 style="text-align: center; color: #1f77b4; font-size: 2.5rem; font-weight: bold;">Information Retrieval System</h1>', unsafe_allow_html=True)
 
 # Dashboard Page
 if page == "Dashboard":
     st.header("System Dashboard")
     
+    # Collection metrics
     col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Documents", len(st.session_state.documents))
+    col2.metric("Metadata entries", len(st.session_state.metadata))
+    col3.metric("URLs in graph", len(st.session_state.url_graph))
+    col4.metric("Indexed", "Yes" if st.session_state.indexed else "No")
     
-    with col1:
-        st.metric("Documents Crawled", len(st.session_state.documents))
-    with col2:
-        st.metric("Documents Indexed", "Yes" if st.session_state.indexed else "No")
-    with col3:
-        st.metric("Documents Processed", "Yes" if st.session_state.processed else "No")
-    with col4:
-        st.metric("URLs in Graph", len(st.session_state.url_graph))
-    
-    st.subheader("System Status")
-    
-    if st.session_state.documents:
-        st.success(f"✓ {len(st.session_state.documents)} documents loaded")
-    else:
-        st.warning("⚠ No documents loaded - Start with Web Crawling")
-    
-    if st.session_state.indexed:
-        st.success("✓ Search index created")
-    else:
-        st.warning("⚠ No search index - Process documents first")
-    
-    if st.session_state.processed:
-        st.success("✓ Text preprocessing completed")
-    else:
-        st.warning("⚠ Text preprocessing not completed")
-    
-    st.subheader("Quick Actions")
+    # Pipeline stage indicators
+    st.subheader("Pipeline Stages")
     col1, col2, col3 = st.columns(3)
+    col1.write(stage_badge(bool(st.session_state.documents), "Data Acquisition"))
+    col2.write(stage_badge(st.session_state.processed, "Preprocessing"))
+    col3.write(stage_badge(st.session_state.indexed, "Indexing"))
     
-    with col1:
-        if st.button("Load Sample Data"):
-            import hashlib
-            # Create sample documents
-            sample_docs = [
-                {
-                    'url': 'https://example.com/doc1',
-                    'content': 'Machine learning is a subset of artificial intelligence that focuses on algorithms that can learn from data. It includes supervised learning, unsupervised learning, and reinforcement learning techniques.',
-                    'hash': hashlib.md5('Machine learning is a subset of artificial intelligence that focuses on algorithms that can learn from data. It includes supervised learning, unsupervised learning, and reinforcement learning techniques.'.encode()).hexdigest()
-                },
-                {
-                    'url': 'https://example.com/doc2',
-                    'content': 'Deep learning uses neural networks with multiple layers to model complex patterns in data. It has achieved remarkable success in image recognition, natural language processing, and speech recognition.',
-                    'hash': hashlib.md5('Deep learning uses neural networks with multiple layers to model complex patterns in data. It has achieved remarkable success in image recognition, natural language processing, and speech recognition.'.encode()).hexdigest()
-                },
-                {
-                    'url': 'https://example.com/doc3',
-                    'content': 'Natural language processing enables computers to understand and generate human language. Applications include machine translation, sentiment analysis, and chatbots.',
-                    'hash': hashlib.md5('Natural language processing enables computers to understand and generate human language. Applications include machine translation, sentiment analysis, and chatbots.'.encode()).hexdigest()
-                },
-                {
-                    'url': 'https://example.com/doc4',
-                    'content': 'Computer vision allows machines to interpret and understand visual information from the world. Key tasks include object detection, image classification, and facial recognition.',
-                    'hash': hashlib.md5('Computer vision allows machines to interpret and understand visual information from the world. Key tasks include object detection, image classification, and facial recognition.'.encode()).hexdigest()
-                },
-                {
-                    'url': 'https://example.com/doc5',
-                    'content': 'Reinforcement learning trains agents to make decisions by rewarding desired behaviors. It has been successfully applied to game playing, robotics, and autonomous systems.',
-                    'hash': hashlib.md5('Reinforcement learning trains agents to make decisions by rewarding desired behaviors. It has been successfully applied to game playing, robotics, and autonomous systems.'.encode()).hexdigest()
-                }
-            ]
-            sample_metadata = [
-                {'title': 'Introduction to Machine Learning', 'url': 'https://example.com/doc1'},
-                {'title': 'Deep Learning Overview', 'url': 'https://example.com/doc2'},
-                {'title': 'Natural Language Processing', 'url': 'https://example.com/doc3'},
-                {'title': 'Computer Vision Applications', 'url': 'https://example.com/doc4'},
-                {'title': 'Reinforcement Learning', 'url': 'https://example.com/doc5'}
-            ]
-            sample_graph = {
-                'https://example.com/doc1': ['https://example.com/doc2', 'https://example.com/doc3'],
-                'https://example.com/doc2': ['https://example.com/doc4'],
-                'https://example.com/doc3': ['https://example.com/doc5'],
-                'https://example.com/doc4': ['https://example.com/doc5'],
-                'https://example.com/doc5': []
-            }
-            
-            st.session_state.documents = sample_docs
-            st.session_state.metadata = sample_metadata
-            st.session_state.url_graph = sample_graph
-            st.success("Sample data loaded successfully!")
-            st.rerun()
-    
-    with col2:
-        if st.button("Process Documents"):
-            if st.session_state.documents:
-                st.session_state.text_mining.load_documents(st.session_state.documents)
-                st.session_state.text_mining.extract_tfidf_features()
-                st.session_state.processed = True
-                st.success("Documents processed successfully!")
-                st.rerun()
-            else:
-                st.error("No documents to process!")
-    
-    with col3:
-        if st.button("Create Index"):
-            if st.session_state.documents and st.session_state.processed:
-                # Pass processed documents to search engine
-                processed_docs = st.session_state.text_mining.processed_docs
-                st.session_state.search_engine.create_index(
-                    st.session_state.documents,
-                    st.session_state.metadata,
-                    processed_docs
-                )
-                if st.session_state.url_graph:
-                    G = st.session_state.search_engine.build_graph(st.session_state.url_graph)
-                    st.session_state.search_engine.calculate_pagerank(G)
-                st.session_state.indexed = True
-                st.success("Index created successfully!")
-                st.rerun()
-            else:
-                st.error("Please load and process documents first!")
-
-# Web Crawling Page
-elif page == "Web Crawling":
-    st.header("Web Crawling Interface")
-    
-    col1, col2 = st.columns([2, 1])
-    
-    with col1:
-        st.subheader("Crawl Configuration")
-        
-        seed_urls_input = st.text_area(
-            "Seed URLs (one per line)",
-            "https://en.wikipedia.org/wiki/Machine_learning\nhttps://en.wikipedia.org/wiki/Deep_learning",
-            height=100
-        )
-        
-        col_a, col_b, col_c = st.columns(3)
-        
-        with col_a:
-            max_depth = st.number_input("Max Depth", min_value=1, max_value=5, value=2)
-        with col_b:
-            max_pages = st.number_input("Max Pages", min_value=1, max_value=500, value=50)
-        with col_c:
-            stay_on_domain = st.checkbox("Stay on Domain", value=True)
-        
-        if st.button("Start Crawling"):
-            seed_urls = [url.strip() for url in seed_urls_input.split('\n') if url.strip()]
-            
-            with st.spinner("Crawling in progress..."):
-                stats = st.session_state.crawler.crawl(
-                    seed_urls=seed_urls,
-                    max_depth=max_depth,
-                    max_pages=max_pages,
-                    stay_on_domain=stay_on_domain
-                )
-                
-                st.session_state.documents = st.session_state.crawler.documents
-                st.session_state.metadata = st.session_state.crawler.metadata
-                st.session_state.url_graph = st.session_state.crawler.url_graph
-                
-                # Save data
-                st.session_state.crawler.save_documents('documents.json')
-                st.session_state.crawler.save_metadata('metadata.csv')
-                st.session_state.crawler.save_graph('url_graph.json')
-            
-            st.success(f"Crawling completed! {stats['pages_crawled']} pages crawled.")
-            
-            col1, col2, col3 = st.columns(3)
-            col1.metric("Pages Crawled", stats['pages_crawled'])
-            col2.metric("Duplicate URLs Skipped", stats['duplicate_urls_skipped'])
-            col3.metric("Duplicate Documents Skipped", stats['duplicate_documents_skipped'])
-    
-    with col2:
-        st.subheader("Load Existing Data")
-        
-        if st.button("Load from Files"):
-            if os.path.exists('documents.json'):
-                st.session_state.crawler.load_documents('documents.json')
-                st.session_state.documents = st.session_state.crawler.documents
-                st.success("Documents loaded!")
-            
-            if os.path.exists('metadata.csv'):
-                st.session_state.crawler.load_metadata('metadata.csv')
-                st.session_state.metadata = st.session_state.crawler.metadata
-                st.success("Metadata loaded!")
-            
-            if os.path.exists('url_graph.json'):
-                st.session_state.crawler.load_graph('url_graph.json')
-                st.session_state.url_graph = st.session_state.crawler.url_graph
-                st.success("URL graph loaded!")
-    
-    if st.session_state.documents:
-        st.subheader("Crawled Documents")
-        doc_df = st.session_state.crawler.get_documents_dataframe()
-        # Display available columns
-        available_cols = [col for col in ['url', 'hash'] if col in doc_df.columns]
-        if available_cols:
-            st.dataframe(doc_df[available_cols], use_container_width=True)
-        else:
-            st.dataframe(doc_df, use_container_width=True)
-
-# Text Preprocessing Page
-elif page == "Text Preprocessing":
-    st.header("Text Preprocessing and Mining")
-    
-    if not st.session_state.documents:
-        st.warning("No documents loaded. Please crawl or load documents first.")
-    else:
-        col1, col2 = st.columns([2, 1])
+    # Collection composition visualization
+    if st.session_state.metadata:
+        st.subheader("Collection Composition")
+        col1, col2 = st.columns(2)
         
         with col1:
-            st.subheader("Preprocessing Options")
+            # Category distribution
+            categories = {}
+            for m in st.session_state.metadata:
+                cat = m.get('category', 'unknown')
+                categories[cat] = categories.get(cat, 0) + 1
             
-            remove_stops = st.checkbox("Remove Stopwords", value=True)
-            lemmatize = st.checkbox("Lemmatize", value=True)
-            
-            if st.button("Process Documents"):
-                st.session_state.text_mining.load_documents(st.session_state.documents)
-                st.session_state.text_mining.extract_tfidf_features()
-                st.session_state.processed = True
-                st.success("Documents processed successfully!")
-                st.rerun()
+            if categories:
+                fig = px.pie(values=list(categories.values()), names=list(categories.keys()), title="Document Categories")
+                st.plotly_chart(fig, use_container_width=True)
         
         with col2:
-            st.subheader("Corpus Statistics")
-            if st.session_state.processed:
-                stats = st.session_state.text_mining.get_corpus_statistics()
-                st.metric("Total Documents", stats['total_documents'])
-                st.metric("Total Words", stats['total_words'])
-                st.metric("Vocabulary Size", stats['vocabulary_size'])
-                st.metric("Avg Doc Length", f"{stats['average_document_length']:.1f}")
+            # Document length distribution
+            lengths = [len(d.get('content', '')) for d in st.session_state.documents]
+            fig = px.histogram(x=lengths, nbins=20, title="Document Length Distribution")
+            st.plotly_chart(fig, use_container_width=True)
+    
+    # Source tracking
+    if st.session_state.documents:
+        st.subheader("Source Tracking")
+        sources = {}
+        for d in st.session_state.documents:
+            url = d.get('url', '')
+            if 'example.com' in url:
+                sources['Bundled dataset'] = sources.get('Bundled dataset', 0) + 1
+            else:
+                sources['Web crawled'] = sources.get('Web crawled', 0) + 1
         
+        if sources:
+            st.write(f"Sources: {', '.join([f'{k}: {v}' for k, v in sources.items()])}")
+    
+    # One-click pipeline
+    st.markdown("---")
+    st.subheader("One-click Pipeline")
+    if st.button("Run full pipeline with bundled dataset"):
+        load_bundled_dataset(include_near_duplicates=False)
+        run_preprocessing(remove_stops=True, lemmatize=True, stem=False, max_features=None, ngram_max=1)
+        build_index()
+        build_link_graph()
+        build_recommender()
+        
+        # Load bundled queries for evaluation
+        for qid, qdata in BUNDLED_QUERIES.items():
+            st.session_state.evaluator.query_text[qid] = qdata['text']
+            st.session_state.evaluator.relevant_docs[qid] = set(qdata['relevant_doc_ids'])
+            if 'graded' in qdata:
+                st.session_state.evaluator.graded_relevance[qid] = qdata['graded']
+        
+        st.success("Full pipeline completed!")
+        st.rerun()
+
+# Data Acquisition Page
+elif page == "Data Acquisition":
+    st.header("Data Acquisition")
+    
+    # Near-duplicate threshold slider
+    st.subheader("Near-duplicate Detection")
+    jaccard_threshold = st.slider("Jaccard similarity threshold for near-duplicates", 0.0, 1.0, 0.75, 0.05)
+    st.session_state.crawler.jaccard_threshold = jaccard_threshold
+    
+    # Tabs for different acquisition modes
+    tab1, tab2, tab3 = st.tabs(["Bundled dataset", "Web crawling", "Upload files"])
+    
+    with tab1:
+        st.subheader("Bundled Dataset")
+        include_near = st.checkbox("Include near-duplicates", value=False)
+        if st.button("Load bundled dataset"):
+            load_bundled_dataset(include_near_duplicates=include_near)
+            st.success(f"Loaded {len(st.session_state.documents)} documents from bundled dataset")
+            st.rerun()
+    
+    with tab2:
+        st.subheader("Web Crawling")
+        seed_urls = st.text_area("Seed URLs (one per line)", "https://example.com/page1\nhttps://example.com/page2", height=100)
+        max_depth = st.number_input("Max depth", 1, 5, 2)
+        max_pages = st.number_input("Max pages", 1, 500, 50)
+        delay = st.number_input("Delay between requests (seconds)", 0.0, 5.0, 1.0, 0.5)
+        domain_restriction = st.checkbox("Restrict to domain", value=True)
+        detect_near_duplicates = st.checkbox("Detect near-duplicates", value=True)
+        
+        if st.button("Start crawl"):
+            seed_list = [url.strip() for url in seed_urls.split('\n') if url.strip()]
+            with st.spinner("Crawling..."):
+                stats = st.session_state.crawler.crawl(
+                    seed_urls=seed_list,
+                    max_depth=max_depth,
+                    max_pages=max_pages,
+                    delay=delay,
+                    stay_on_domain=domain_restriction,
+                    detect_near_duplicates=detect_near_duplicates
+                )
+                sync_collection_from_crawler()
+            
+            st.success(f"Crawl completed: {stats['pages_crawled']} pages")
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Pages crawled", stats['pages_crawled'])
+            col2.metric("Duplicates skipped", stats.get('duplicate_urls_skipped', 0))
+            col3.metric("Near-duplicates", stats.get('near_duplicates', 0))
+    
+    with tab3:
+        st.subheader("Upload Files")
+        uploaded_files = st.file_uploader("Upload documents", type=['json', 'csv', 'txt'], accept_multiple_files=True)
+        
+        if uploaded_files:
+            for file in uploaded_files:
+                if file.type == 'application/json':
+                    data = json.load(file)
+                    if isinstance(data, list):
+                        for item in data:
+                            if isinstance(item, dict) and 'content' in item:
+                                st.session_state.documents.append(item)
+                elif file.type == 'text/csv':
+                    df = pd.read_csv(file)
+                    for _, row in df.iterrows():
+                        if 'content' in row:
+                            st.session_state.documents.append(row.to_dict())
+                elif file.type == 'text/plain':
+                    content = file.read().decode('utf-8')
+                    st.session_state.documents.append({
+                        'url': f'uploaded://{file.name}',
+                        'content': content,
+                        'hash': hash(content)
+                    })
+            
+            invalidate_downstream()
+            st.success(f"Uploaded {len(uploaded_files)} files")
+    
+    # Duplicate handling report
+    if st.session_state.documents:
+        duplicate_report = st.session_state.crawler.get_duplicate_report()
+        if not duplicate_report.empty:
+            st.subheader("Duplicate and Near-duplicate Handling")
+            st.dataframe(duplicate_report, use_container_width=True)
+    
+    # Stored collection
+    if st.session_state.documents:
+        st.markdown("---")
+        st.subheader("Stored Collection")
+        
+        tab_a, tab_b, tab_c, tab_d = st.tabs(["Document content", "Metadata", "Link graph", "Export"])
+        
+        with tab_a:
+            for i, doc in enumerate(st.session_state.documents):
+                with st.expander(f"Document {i}: {doc.get('url', '')[:50]}"):
+                    st.text_area("Content", doc.get('content', ''), height=200, key=f"doc_{i}")
+        
+        with tab_b:
+            if st.session_state.metadata:
+                st.dataframe(pd.DataFrame(st.session_state.metadata), use_container_width=True)
+            else:
+                st.info("No metadata available")
+        
+        with tab_c:
+            if st.session_state.url_graph:
+                st.json(st.session_state.url_graph)
+            else:
+                st.info("No URL graph available")
+        
+        with tab_d:
+            if st.button("Export documents as JSON"):
+                json_data = json.dumps(st.session_state.documents, indent=2)
+                st.download_button("Download", json_data, file_name="documents.json", mime="application/json")
+
+# Text Preprocessing & Mining Page
+elif page == "Text Preprocessing & Mining":
+    st.header("Text Preprocessing & Mining")
+    
+    if not st.session_state.documents:
+        st.warning("No documents loaded. Please acquire documents first.")
+    else:
+        # Preprocessing configuration
+        st.subheader("Preprocessing Configuration")
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            remove_stops = st.checkbox("Remove stopwords", value=True)
+            lemmatize = st.checkbox("Lemmatize", value=True)
+        
+        with col2:
+            stem = st.checkbox("Porter stemming", value=False)
+            max_features = st.number_input("Max features (None for all)", min_value=100, max_value=10000, value=None)
+        
+        with col3:
+            ngram_max = st.slider("N-gram max", 1, 3, 1)
+        
+        if st.button("Run preprocessing"):
+            with st.spinner("Processing..."):
+                run_preprocessing(remove_stops, lemmatize, stem, max_features, ngram_max)
+            st.success("Preprocessing completed!")
+            st.rerun()
+        
+        # Corpus statistics
         if st.session_state.processed:
-            st.subheader("Visualizations")
+            st.subheader("Corpus Statistics")
+            stats = st.session_state.text_mining.get_corpus_statistics()
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("Documents", stats['total_documents'])
+            col2.metric("Total words", stats['total_words'])
+            col3.metric("Vocabulary", stats['vocabulary_size'])
+            col4.metric("Avg length", f"{stats['average_document_length']:.1f}")
             
-            col1, col2 = st.columns(2)
+            # Active preprocessing pipeline
+            st.info(f"Active pipeline: stopwords={remove_stops}, lemmatize={lemmatize}, stem={stem}, max_features={max_features}, ngram_max={ngram_max}")
             
-            with col1:
-                st.plotly_chart(
-                    st.session_state.text_mining.visualize_document_lengths(),
-                    use_container_width=True
-                )
+            # Tabs for different analyses
+            tab1, tab2, tab3, tab4, tab5 = st.tabs(["Corpus characteristics", "Keywords & profiling", "Strategy comparison", "Classification", "Topics & clusters"])
             
-            with col2:
-                st.plotly_chart(
-                    st.session_state.text_mining.visualize_vocabulary_distribution(),
-                    use_container_width=True
-                )
-            
-            st.subheader("Topic Modeling")
-            n_topics = st.slider("Number of Topics", min_value=2, max_value=10, value=5)
-            
-            if st.button("Run Topic Modeling"):
-                topics = st.session_state.text_mining.perform_topic_modeling(n_topics=n_topics)
+            with tab1:
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.plotly_chart(st.session_state.text_mining.visualize_document_lengths(), use_container_width=True)
+                with col2:
+                    st.plotly_chart(st.session_state.text_mining.visualize_vocabulary_distribution(), use_container_width=True)
                 
-                for i, topic in enumerate(topics):
-                    st.write(f"**Topic {i+1}:** {', '.join(topic)}")
-                
-                st.plotly_chart(
-                    st.session_state.text_mining.visualize_topic_distribution(topics),
-                    use_container_width=True
-                )
+                # Feature distribution
+                if hasattr(st.session_state.text_mining, 'tfidf_matrix'):
+                    fig = px.histogram(x=st.session_state.text_mining.tfidf_matrix.data, nbins=50, title="TF-IDF Feature Distribution")
+                    st.plotly_chart(fig, use_container_width=True)
             
-            st.subheader("Document Clustering")
-            n_clusters = st.slider("Number of Clusters", min_value=2, max_value=10, value=3)
+            with tab2:
+                st.subheader("Keyword extraction (TF-IDF)")
+                top_k = st.slider("Top K keywords", 5, 50, 20)
+                if st.button("Extract keywords"):
+                    keywords = st.session_state.text_mining.extract_keywords(top_k=top_k)
+                    for doc_id, words in enumerate(keywords):
+                        st.write(f"Doc {doc_id}: {', '.join(words[:10])}")
+                
+                st.subheader("Document profiling")
+                if st.button("Profile documents"):
+                    profiles = st.session_state.text_mining.profile_documents()
+                    st.dataframe(pd.DataFrame(profiles), use_container_width=True)
             
-            if st.button("Cluster Documents"):
-                cluster_result = st.session_state.text_mining.cluster_documents(n_clusters=n_clusters)
+            with tab3:
+                st.subheader("Strategy comparison")
+                strategies = [
+                    {"remove_stops": True, "lemmatize": True, "stem": False, "max_features": None, "ngram_max": 1},
+                    {"remove_stops": True, "lemmatize": True, "stem": True, "max_features": None, "ngram_max": 1},
+                    {"remove_stops": True, "lemmatize": False, "stem": False, "max_features": 1000, "ngram_max": 1},
+                ]
                 
-                st.plotly_chart(
-                    st.session_state.text_mining.visualize_clusters(cluster_result),
-                    use_container_width=True
-                )
+                if st.button("Compare strategies"):
+                    results = []
+                    for i, strat in enumerate(strategies):
+                        st.session_state.text_mining.load_documents(st.session_state.documents)
+                        st.session_state.text_mining.extract_tfidf_features(**strat)
+                        stats = st.session_state.text_mining.get_corpus_statistics()
+                        results.append({
+                            'strategy': f"Strategy {i+1}",
+                            'vocabulary': stats['vocabulary_size'],
+                            'remove_stops': strat['remove_stops'],
+                            'lemmatize': strat['lemmatize'],
+                            'stem': strat['stem'],
+                            'max_features': strat['max_features']
+                        })
+                    st.dataframe(pd.DataFrame(results), use_container_width=True)
+            
+            with tab4:
+                st.subheader("Document Classification")
+                if BUNDLED_LABELS:
+                    # Use bundled labels if available
+                    labels = [BUNDLED_LABELS.get(i, 'unknown') for i in range(len(st.session_state.documents))]
+                else:
+                    # Manual labeling
+                    st.info("No labels available. Please label documents manually.")
+                    labels = [st.selectbox(f"Label for doc {i}", ['ml', 'dl', 'nlp', 'cv', 'rl', 'data'], key=f"label_{i}") for i in range(len(st.session_state.documents))]
                 
-                for cluster_id, terms in cluster_result['cluster_terms'].items():
-                    st.write(f"**Cluster {cluster_id}:** {', '.join(terms)}")
+                classifier_type = st.selectbox("Classifier", ["logistic_regression", "naive_bayes", "linear_svm"])
+                test_size = st.slider("Test size", 0.1, 0.5, 0.2)
+                
+                if st.button("Train classifier"):
+                    with st.spinner("Training..."):
+                        results = st.session_state.text_mining.classify_documents(labels, classifier_type=classifier_type, test_size=test_size)
+                    
+                    col1, col2, col3 = st.columns(3)
+                    col1.metric("Accuracy", f"{results['accuracy']:.4f}")
+                    col2.metric("CV Accuracy", f"{results['cv_accuracy']:.4f}")
+                    col3.metric("F1 (macro)", f"{results['f1_macro']:.4f}")
+                    
+                    st.dataframe(pd.DataFrame(results['classification_report']).transpose(), use_container_width=True)
+                    
+                    # Confusion matrix
+                    fig = px.imshow(results['confusion_matrix'], text_auto=True, title="Confusion Matrix")
+                    st.plotly_chart(fig, use_container_width=True)
+            
+            with tab5:
+                st.subheader("Topic Modeling (LDA)")
+                n_topics = st.slider("Number of topics", 2, 10, 5)
+                if st.button("Run LDA"):
+                    topics = st.session_state.text_mining.perform_topic_modeling(n_topics=n_topics)
+                    for i, topic in enumerate(topics):
+                        st.write(f"Topic {i+1}: {', '.join(topic)}")
+                    
+                    fig = px.bar(x=[f"Topic {i+1}" for i in range(len(topics))], y=[len(t) for t in topics], title="Topic Word Counts")
+                    st.plotly_chart(fig, use_container_width=True)
+                
+                st.subheader("Document Clustering (K-means)")
+                n_clusters = st.slider("Number of clusters", 2, 10, 3)
+                if st.button("Run K-means"):
+                    cluster_result = st.session_state.text_mining.cluster_documents(n_clusters=n_clusters)
+                    st.plotly_chart(st.session_state.text_mining.visualize_clusters(cluster_result), use_container_width=True)
+                    
+                    for cluster_id, terms in cluster_result['cluster_terms'].items():
+                        st.write(f"Cluster {cluster_id}: {', '.join(terms)}")
 
 # Index Management Page
 elif page == "Index Management":
     st.header("Index Management")
     
     if not st.session_state.documents:
-        st.warning("No documents loaded. Please crawl or load documents first.")
+        st.warning("No documents loaded. Please acquire documents first.")
     else:
+        # Build index
+        st.subheader("Build Search Index")
         col1, col2 = st.columns(2)
         
         with col1:
-            st.subheader("Create Search Index")
-            
-            if st.button("Create/Rebuild Index"):
-                # Pass processed documents if available
-                processed_docs = None
-                if st.session_state.processed:
-                    processed_docs = st.session_state.text_mining.processed_docs
-                
-                st.session_state.search_engine.create_index(
-                    st.session_state.documents,
-                    st.session_state.metadata,
-                    processed_docs
-                )
-                st.session_state.indexed = True
-                st.success("Index created successfully!")
+            if st.button("Build TF-IDF index"):
+                run_preprocessing(remove_stops=True, lemmatize=True, stem=False, max_features=None, ngram_max=1)
+                build_index()
+                st.success("TF-IDF index built!")
+                st.rerun()
         
         with col2:
-            st.subheader("Build URL Graph")
-            
-            if st.session_state.url_graph:
-                if st.button("Build Graph & Calculate PageRank"):
-                    G = st.session_state.search_engine.build_graph(st.session_state.url_graph)
-                    pr_scores = st.session_state.search_engine.calculate_pagerank(G)
-                    st.success(f"Graph built with {len(pr_scores)} nodes")
-            else:
-                st.info("No URL graph available")
+            if st.button("Build BM25 index"):
+                run_preprocessing(remove_stops=True, lemmatize=True, stem=False, max_features=None, ngram_max=1)
+                build_index()
+                st.success("BM25 index built!")
+                st.rerun()
         
+        # Build URL graph
+        st.subheader("Build URL Graph")
+        if st.button("Build graph & compute PageRank/HITS"):
+            build_link_graph()
+            st.success("Link analysis completed!")
+            st.rerun()
+        
+        # Index statistics
         if st.session_state.indexed:
             st.subheader("Index Statistics")
-            st.metric("Index Status", "Active")
-            st.metric("Documents Indexed", len(st.session_state.documents))
+            stats = st.session_state.search_engine.get_index_statistics()
             
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("Documents indexed", stats['documents_indexed'])
+            col2.metric("Vocabulary size", stats['vocabulary_size'])
+            col3.metric("Postings", stats['posting_entries'])
+            col4.metric("Build time", f"{stats['index_build_seconds']:.2f}s")
+            
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Matrix density", f"{stats['matrix_density']:.4f}")
+            col2.metric("Postings/doc", f"{stats['avg_postings_per_document']:.2f}")
+            col3.metric("Avg doc length", f"{stats['avg_document_length']:.1f}")
+            
+            # Link analysis summary
             if st.session_state.url_graph:
-                st.subheader("Graph Statistics")
-                G = st.session_state.search_engine.build_graph(st.session_state.url_graph)
-                st.metric("Nodes", G.number_of_nodes())
-                st.metric("Edges", G.number_of_edges())
+                st.subheader("Link Analysis Summary")
+                if hasattr(st.session_state.search_engine, 'pagerank_scores'):
+                    pr_scores = st.session_state.search_engine.pagerank_scores
+                    if pr_scores:
+                        col1.metric("PageRank nodes", len(pr_scores))
+                        col2.metric("Max PageRank", f"{max(pr_scores.values()):.4f}")
+                        col3.metric("Min PageRank", f"{min(pr_scores.values()):.4f}")
+                
+                if hasattr(st.session_state.search_engine, 'hits_scores'):
+                    hits = st.session_state.search_engine.hits_scores
+                    if hits:
+                        hubs = hits.get('hubs', {})
+                        auths = hits.get('authorities', {})
+                        col1.metric("HITS nodes", len(hubs))
+                        col2.metric("Max Authority", f"{max(auths.values()) if auths else 0:.4f}")
+                        col3.metric("Max Hub", f"{max(hubs.values()) if hubs else 0:.4f}")
 
-# Web Search Page
-elif page == "Web Search":
-    st.header("Web Search Interface")
+# Search Interface Page
+elif page == "Search Interface":
+    st.header("Search Interface")
     
     if not st.session_state.indexed:
-        st.warning("Search index not created. Please create index first.")
+        st.warning("Index not built. Please build index first.")
     else:
+        # Query input
         st.subheader("Search Query")
+        query = st.text_input("Enter your query", "")
         
-        query = st.text_input("Enter your search query:", "")
+        # Query syntax hints
+        with st.expander("Query syntax hints"):
+            st.markdown("""
+            - **Phrase search**: Use quotes for exact phrases: `"machine learning"`
+            - **Required terms**: Use + before term: `+neural +network`
+            - **Excluded terms**: Use - before term: `deep -learning`
+            - **OR operator**: Use | between terms: `ml|ai`
+            """)
         
-        col1, col2, col3 = st.columns(3)
+        # Ranking method selection
+        col1, col2, col3, col4 = st.columns(4)
         
         with col1:
-            ranking_method = st.selectbox("Ranking Method", ["tfidf", "pagerank", "hits"])
-        with col2:
-            limit = st.number_input("Number of Results", min_value=1, max_value=50, value=10)
-        with col3:
-            st.empty()
+            ranking_method = st.selectbox("Ranking method", ["tfidf", "bm25", "pagerank", "hits", "hybrid"])
         
+        with col2:
+            limit = st.number_input("Results limit", 1, 50, 10)
+        
+        with col3:
+            link_weight = st.slider("Link weight", 0.0, 1.0, 0.3, 0.05, key="search_link_weight")
+        
+        with col4:
+            expand = st.checkbox("Use query expansion", value=False)
+        
+        # Metadata/content filters
+        with st.expander("Filters"):
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                category_filter = st.selectbox("Category filter", ["all"] + list(set([m.get('category', 'unknown') for m in st.session_state.metadata])))
+                min_length = st.number_input("Min document length", 0, 10000, 0)
+            
+            with col2:
+                must_contain = st.text_input("Must contain")
+                must_not_contain = st.text_input("Must not contain")
+        
+        # Search button
         if st.button("Search"):
             if query:
+                started = time.perf_counter()
                 results = st.session_state.search_engine.search(
                     query=query,
                     limit=limit,
-                    ranking_method=ranking_method
+                    ranking_method=ranking_method,
+                    link_weight=link_weight,
+                    expand=expand,
+                    category_filter=category_filter if category_filter != "all" else None,
+                    min_length=min_length if min_length > 0 else None,
+                    must_contain=must_contain if must_contain else None,
+                    must_not_contain=must_not_contain if must_not_contain else None
                 )
+                elapsed = (time.perf_counter() - started) * 1000
                 
-                st.subheader(f"Search Results ({len(results)} found)")
+                log_query(query, results, elapsed, ranking_method)
                 
-                for i, result in enumerate(results, 1):
-                    with st.expander(f"{i}. {result['title'] or result['url']}"):
-                        st.write(f"**URL:** {result['url']}")
-                        st.write(f"**Score:** {result['score']:.4f}")
-                        if ranking_method == 'pagerank' and 'pagerank_score' in result:
-                            st.write(f"**PageRank Score:** {result['pagerank_score']:.4f}")
-                        if ranking_method == 'hits' and 'authority_score' in result:
-                            st.write(f"**Authority Score:** {result['authority_score']:.4f}")
-                        st.write(f"**Content Preview:** {result['content']}")
+                # Display metrics
+                st.subheader("Search Results")
+                col1, col2, col3, col4 = st.columns(4)
+                col1.metric("Results", len(results))
+                col2.metric("Latency", f"{elapsed:.2f}ms")
+                col3.metric("Matched docs", len(st.session_state.search_engine.last_matched_docs) if hasattr(st.session_state.search_engine, 'last_matched_docs') else 0)
+                col4.metric("Method", ranking_method)
+                
+                # Query processing details
+                with st.expander("Query processing details"):
+                    if hasattr(st.session_state.search_engine, 'last_query_info'):
+                        info = st.session_state.search_engine.last_query_info
+                        st.json(info)
+                
+                # Ranked results table
+                if results:
+                    st.dataframe(results_table(results), use_container_width=True)
+                    
+                    # Individual result expanders
+                    for i, result in enumerate(results, 1):
+                        with st.expander(f"{i}. {result.get('title', result.get('url', ''))}"):
+                            st.write(f"**Score:** {result.get('score', 0):.4f}")
+                            st.write(f"**URL:** {result.get('url', '')}")
+                            if 'pagerank_score' in result:
+                                st.write(f"**PageRank:** {result['pagerank_score']:.4f}")
+                            if 'authority_score' in result:
+                                st.write(f"**Authority:** {result['authority_score']:.4f}")
+                            if 'hub_score' in result:
+                                st.write(f"**Hub:** {result['hub_score']:.4f}")
+                            st.write(f"**Category:** {result.get('category', 'N/A')}")
+                            st.write(f"**Length:** {len(result.get('content', ''))} chars")
+                            st.text_area("Content preview", result.get('content', '')[:500], height=100)
+                else:
+                    st.info("No documents matched your query.")
             else:
-                st.warning("Please enter a search query.")
-        
-        st.subheader("Advanced Search")
-        
-        with st.expander("Advanced Options"):
-            min_length = st.number_input("Minimum Document Length", min_value=0, value=0)
-            must_contain = st.text_input("Must Contain Word", "")
-            
-            if st.button("Advanced Search"):
-                filters = {}
-                if min_length > 0:
-                    filters['min_length'] = min_length
-                if must_contain:
-                    filters['must_contain'] = must_contain
-                
-                results = st.session_state.search_engine.advanced_search(
-                    query=query,
-                    filters=filters,
-                    limit=limit
-                )
-                
-                st.write(f"Found {len(results)} results with filters")
+                st.warning("Please enter a query.")
 
 # Ranking Visualization Page
 elif page == "Ranking Visualization":
     st.header("Ranking Visualization")
     
-    if not st.session_state.url_graph:
-        st.warning("No URL graph available. Please crawl documents first.")
+    st.caption("Ranking determines what users see out of the candidate documents. Different methods emphasize different signals.")
+    
+    if not st.session_state.indexed:
+        st.warning("Index not built. Please build index first.")
+    elif not st.session_state.url_graph:
+        st.warning("No URL graph available. Link analysis requires a graph.")
     else:
-        st.subheader("PageRank Scores")
+        # Compute PageRank & HITS if not ready
+        if not hasattr(st.session_state.search_engine, 'pagerank_scores'):
+            if st.button("Compute PageRank & HITS"):
+                build_link_graph()
+                st.success("Link analysis computed!")
+                st.rerun()
         
-        if st.button("Calculate and Visualize PageRank"):
-            G = st.session_state.search_engine.build_graph(st.session_state.url_graph)
-            pr_scores = st.session_state.search_engine.calculate_pagerank(G)
+        # Tabs for different visualizations
+        tab1, tab2, tab3, tab4 = st.tabs(["Method comparison", "PageRank", "HITS", "Graph structure"])
+        
+        with tab1:
+            st.subheader("Compare ranking methods")
+            query = st.text_input("Query", "machine learning")
+            candidates_limit = st.slider("Candidates limit", 5, 50, 20)
+            link_weight = st.slider("Link weight", 0.0, 1.0, 0.3, 0.05, key="rank_link_weight")
             
-            st.plotly_chart(
-                st.session_state.search_engine.visualize_pagerank_scores(top_n=20),
-                use_container_width=True
-            )
+            if st.button("Compare rankings"):
+                methods = ["tfidf", "bm25", "pagerank", "hits", "hybrid"]
+                rankings = {}
+                
+                for method in methods:
+                    results = st.session_state.search_engine.search(
+                        query=query,
+                        limit=candidates_limit,
+                        ranking_method=method,
+                        link_weight=link_weight
+                    )
+                    rankings[method] = [r.get('url', '') for r in results]
+                
+                # Build rank table
+                rank_data = []
+                for i in range(candidates_limit):
+                    row = {'rank': i + 1}
+                    for method in methods:
+                        if i < len(rankings[method]):
+                            row[method] = rankings[method][i][:30]
+                        else:
+                            row[method] = '-'
+                    rank_data.append(row)
+                
+                st.dataframe(pd.DataFrame(rank_data), use_container_width=True)
+                st.caption("Read the table: each row is a rank position; columns show which document each method puts there.")
+                
+                # Visualization
+                fig = go.Figure()
+                for method in methods:
+                    fig.add_trace(go.Scatter(
+                        x=list(range(1, len(rankings[method]) + 1)),
+                        y=list(range(1, len(rankings[method]) + 1)),
+                        mode='lines+markers',
+                        name=method
+                    ))
+                fig.update_layout(title="Rank positions by method", xaxis_title="Rank", yaxis_title="Position")
+                st.plotly_chart(fig, use_container_width=True)
         
-        st.subheader("HITS Scores")
+        with tab2:
+            st.subheader("PageRank Scores")
+            if hasattr(st.session_state.search_engine, 'pagerank_scores'):
+                pr_scores = st.session_state.search_engine.pagerank_scores
+                sorted_pr = sorted(pr_scores.items(), key=lambda x: x[1], reverse=True)
+                
+                df = pd.DataFrame(sorted_pr, columns=['URL', 'PageRank'])
+                st.dataframe(df.head(20), use_container_width=True)
+                
+                fig = px.bar(x=[url[:30] for url, _ in sorted_pr[:20]], y=[score for _, score in sorted_pr[:20]], title="Top 20 PageRank Scores")
+                st.plotly_chart(fig, use_container_width=True)
+                
+                st.caption("PageRank measures the importance of a page based on the number and quality of links to it.")
+            else:
+                st.info("PageRank not computed yet.")
         
-        if st.button("Calculate and Visualize HITS"):
-            G = st.session_state.search_engine.build_graph(st.session_state.url_graph)
-            hubs, authorities = st.session_state.search_engine.calculate_hits(G)
-            
-            st.plotly_chart(
-                st.session_state.search_engine.visualize_hits_scores(top_n=20),
-                use_container_width=True
-            )
+        with tab3:
+            st.subheader("HITS Scores")
+            if hasattr(st.session_state.search_engine, 'hits_scores'):
+                hits = st.session_state.search_engine.hits_scores
+                hubs = hits.get('hubs', {})
+                auths = hits.get('authorities', {})
+                
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    st.write("**Authorities** (good hubs point to them)")
+                    sorted_auth = sorted(auths.items(), key=lambda x: x[1], reverse=True)
+                    df_auth = pd.DataFrame(sorted_auth, columns=['URL', 'Authority'])
+                    st.dataframe(df_auth.head(10), use_container_width=True)
+                    
+                    fig_auth = px.bar(x=[url[:30] for url, _ in sorted_auth[:10]], y=[score for _, score in sorted_auth[:10]], title="Top 10 Authority Scores")
+                    st.plotly_chart(fig_auth, use_container_width=True)
+                
+                with col2:
+                    st.write("**Hubs** (point to good authorities)")
+                    sorted_hubs = sorted(hubs.items(), key=lambda x: x[1], reverse=True)
+                    df_hubs = pd.DataFrame(sorted_hubs, columns=['URL', 'Hub'])
+                    st.dataframe(df_hubs.head(10), use_container_width=True)
+                    
+                    fig_hubs = px.bar(x=[url[:30] for url, _ in sorted_hubs[:10]], y=[score for _, score in sorted_hubs[:10]], title="Top 10 Hub Scores")
+                    st.plotly_chart(fig_hubs, use_container_width=True)
+                
+                st.caption("HITS identifies two types of important pages: hubs (good directories) and authorities (authoritative sources).")
+            else:
+                st.info("HITS not computed yet.")
         
-        st.subheader("URL Graph Structure")
-        
-        if st.button("Visualize Graph"):
-            G = st.session_state.search_engine.build_graph(st.session_state.url_graph)
-            st.plotly_chart(
-                st.session_state.search_engine.visualize_graph(G, top_n=30),
-                use_container_width=True
-            )
+        with tab4:
+            st.subheader("Graph Structure")
+            if st.session_state.url_graph:
+                G = st.session_state.search_engine.build_graph(st.session_state.url_graph)
+                
+                col1, col2, col3, col4 = st.columns(4)
+                col1.metric("Nodes", G.number_of_nodes())
+                col2.metric("Edges", G.number_of_edges())
+                col3.metric("Density", f"{nx.density(G):.4f}")
+                col4.metric("Avg degree", f"{sum(dict(G.degree()).values())/G.number_of_nodes():.2f}")
+                
+                st.plotly_chart(st.session_state.search_engine.visualize_graph(G, top_n=30), use_container_width=True)
+            else:
+                st.info("No URL graph available.")
 
 # Recommendation Panel Page
 elif page == "Recommendation Panel":
     st.header("Recommendation Panel")
     
-    if not st.session_state.processed:
-        st.warning("Documents not processed. Please process documents first.")
+    if not st.session_state.documents:
+        st.warning("No documents loaded. Please acquire documents first.")
     else:
-        st.subheader("Recommendation Settings")
+        # Select recommendation approach
+        approach = st.radio("Recommendation approach", ["content", "collaborative", "hybrid"])
+        st.session_state.recommender.approach = approach
         
-        approach = st.selectbox("Recommendation Approach", ["content", "hybrid"])
+        # Build recommender
+        build_recommender()
         
+        # Display recommender statistics
+        stats = st.session_state.recommender.get_statistics()
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Documents", stats['total_documents'])
+        col2.metric("Content features", stats['content_features'])
+        col3.metric("Rated documents", stats['rated_documents'])
+        col4.metric("Matrix sparsity", f"{stats['matrix_sparsity_%']}%")
+        
+        # Warning for collaborative/hybrid without ratings
+        if approach in ["collaborative", "hybrid"] and stats['rated_documents'] == 0:
+            st.warning("Collaborative filtering requires ratings. Using bundled ratings.")
+            # Load bundled ratings
+            st.session_state.recommender.ratings = BUNDLED_RATINGS
+        
+        # Recommendation parameters
+        st.subheader("Recommendation Parameters")
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            top_k = st.slider("Top-K recommendations", 1, 20, 5)
+        
+        with col2:
+            if approach == "hybrid":
+                content_weight = st.slider("Content weight", 0.0, 1.0, 0.5, 0.1)
+                collaborative_weight = 1.0 - content_weight
+        
+        # Collaborative mode selection
+        if approach == "collaborative" or approach == "hybrid":
+            collaborative_mode = st.radio("Collaborative mode", ["user-based", "item-based"])
+        else:
+            collaborative_mode = "user-based"
+        
+        # Content mode selection
         if approach == "content":
-            st.session_state.recommender.fit(
-                st.session_state.documents,
-                approach='content'
-            )
-        elif approach == "hybrid":
-            st.session_state.recommender.fit(
-                st.session_state.documents,
-                approach='hybrid'
-            )
+            content_mode = st.radio("Content mode", ["similar to document", "free-text query"])
+        else:
+            content_mode = "similar to document"
         
-        st.subheader("Get Recommendations")
+        # Generate recommendations
+        st.subheader("Generate Recommendations")
         
-        rec_method = st.radio("Method", ["By Document", "By Query"])
-        
-        if rec_method == "By Document":
-            doc_options = [f"{i}: {doc['url'][:50]}" for i, doc in enumerate(st.session_state.documents)]
-            selected_doc = st.selectbox("Select Document", range(len(st.session_state.documents)), 
-                                      format_func=lambda x: doc_options[x])
+        if content_mode == "similar to document":
+            doc_options = document_options()
+            selected_doc = st.selectbox("Select document", range(len(st.session_state.documents)), format_func=lambda x: doc_options[x])
             
-            top_k = st.slider("Number of Recommendations", min_value=1, max_value=10, value=5)
-            
-            if st.button("Get Recommendations"):
+            if st.button("Get recommendations"):
                 recommendations = st.session_state.recommender.recommend(
                     doc_index=selected_doc,
-                    top_k=top_k
+                    top_k=top_k,
+                    collaborative_mode=collaborative_mode,
+                    content_weight=content_weight if approach == "hybrid" else 1.0,
+                    collaborative_weight=collaborative_weight if approach == "hybrid" else 0.0
                 )
                 
-                st.subheader(f"Top {len(recommendations)} Recommendations")
-                
-                for i, rec in enumerate(recommendations, 1):
-                    with st.expander(f"{i}. {rec['url'][:60]}"):
-                        st.write(f"**Similarity Score:** {rec['similarity_score']:.4f}")
-                        st.write(f"**Content Preview:** {rec['content_preview']}")
-                
+                # Display recommendations
                 if recommendations:
-                    st.plotly_chart(
-                        st.session_state.recommender.visualize_recommendations(recommendations),
-                        use_container_width=True
-                    )
-        
+                    st.dataframe(pd.DataFrame(recommendations), use_container_width=True)
+                    
+                    fig = px.bar(x=[r['url'][:30] for r in recommendations], y=[r['similarity_score'] for r in recommendations], title="Recommendation Scores")
+                    st.plotly_chart(fig, use_container_width=True)
+                    
+                    for i, rec in enumerate(recommendations, 1):
+                        with st.expander(f"{i}. {rec['url'][:60]}"):
+                            st.write(f"**Score:** {rec['similarity_score']:.4f}")
+                            st.text_area("Content preview", rec.get('content_preview', ''), height=100)
         else:
-            query = st.text_input("Enter Query:", "")
-            top_k = st.slider("Number of Recommendations", min_value=1, max_value=10, value=5)
+            query = st.text_input("Enter query")
             
-            if st.button("Get Recommendations"):
+            if st.button("Get recommendations"):
                 recommendations = st.session_state.recommender.recommend(
                     query=query,
-                    top_k=top_k
+                    top_k=top_k,
+                    collaborative_mode=collaborative_mode,
+                    content_weight=content_weight if approach == "hybrid" else 1.0,
+                    collaborative_weight=collaborative_weight if approach == "hybrid" else 0.0
                 )
                 
-                st.subheader(f"Top {len(recommendations)} Recommendations")
-                
-                for i, rec in enumerate(recommendations, 1):
-                    with st.expander(f"{i}. {rec['url'][:60]}"):
-                        st.write(f"**Similarity Score:** {rec['similarity_score']:.4f}")
-                        st.write(f"**Content Preview:** {rec['content_preview']}")
-                
+                # Display recommendations
                 if recommendations:
-                    st.plotly_chart(
-                        st.session_state.recommender.visualize_recommendations(recommendations),
-                        use_container_width=True
-                    )
+                    st.dataframe(pd.DataFrame(recommendations), use_container_width=True)
+                    
+                    fig = px.bar(x=[r['url'][:30] for r in recommendations], y=[r['similarity_score'] for r in recommendations], title="Recommendation Scores")
+                    st.plotly_chart(fig, use_container_width=True)
+                    
+                    for i, rec in enumerate(recommendations, 1):
+                        with st.expander(f"{i}. {rec['url'][:60]}"):
+                            st.write(f"**Score:** {rec['similarity_score']:.4f}")
+                            st.text_area("Content preview", rec.get('content_preview', ''), height=100)
+        
+        # Comparison of approaches
+        st.markdown("---")
+        st.subheader("Comparison of the three approaches")
+        
+        query_doc = st.selectbox("Select query document for comparison", range(len(st.session_state.documents)), format_func=lambda x: document_options()[x])
+        
+        if st.button("Compare approaches"):
+            # Get recommendations from each approach
+            content_recs = st.session_state.recommender.recommend(doc_index=query_doc, top_k=top_k, approach='content')
+            collab_recs = st.session_state.recommender.recommend(doc_index=query_doc, top_k=top_k, approach='collaborative')
+            hybrid_recs = st.session_state.recommender.recommend(doc_index=query_doc, top_k=top_k, approach='hybrid')
+            
+            st.write(f"Content-based: {len(content_recs)} suggestions")
+            st.write(f"Collaborative: {len(collab_recs)} suggestions")
+            st.write(f"Hybrid: {len(hybrid_recs)} suggestions")
+            
+            # Display comparison
+            comparison_data = []
+            for i in range(top_k):
+                row = {'rank': i + 1}
+                if i < len(content_recs):
+                    row['content'] = content_recs[i]['url'][:30]
+                else:
+                    row['content'] = '-'
+                if i < len(collab_recs):
+                    row['collaborative'] = collab_recs[i]['url'][:30]
+                else:
+                    row['collaborative'] = '-'
+                if i < len(hybrid_recs):
+                    row['hybrid'] = hybrid_recs[i]['url'][:30]
+                else:
+                    row['hybrid'] = '-'
+                comparison_data.append(row)
+            
+            st.dataframe(pd.DataFrame(comparison_data), use_container_width=True)
+            
+            # Visualize user-item rating matrix
+            if BUNDLED_RATINGS:
+                with st.expander("User-item rating matrix"):
+                    ratings_df = pd.DataFrame(BUNDLED_RATINGS).fillna(0)
+                    fig = px.imshow(ratings_df, text_auto=True, title="User-Item Rating Matrix")
+                    st.plotly_chart(fig, use_container_width=True)
 
 # Evaluation Dashboard Page
 elif page == "Evaluation Dashboard":
     st.header("Evaluation Dashboard")
     
-    st.subheader("Setup Evaluation")
-    
-    st.write("To evaluate the system, you need to define relevant documents for queries.")
-    
-    # Query setup
-    query_id = st.text_input("Query ID", "q1")
-    query_text = st.text_input("Query Text", "machine learning")
-    
-    # Select relevant documents
-    if st.session_state.documents:
-        doc_options = [f"{i}: {doc['url'][:50]}" for i, doc in enumerate(st.session_state.documents)]
-        relevant_docs = st.multiselect(
-            "Select Relevant Documents",
-            range(len(st.session_state.documents)),
-            format_func=lambda x: doc_options[x]
-        )
+    if not st.session_state.indexed:
+        st.warning("Index not built. Please build index first.")
+    else:
+        # Tabs for evaluation functions
+        tab1, tab2, tab3 = st.tabs(["Relevance judgements", "Run & compare", "Per-query analysis"])
         
-        if st.button("Add Query to Evaluation"):
-            st.session_state.evaluator.set_relevant_documents(
-                query_id,
-                set([str(i) for i in relevant_docs])
-            )
-            st.success(f"Query {query_id} added to evaluation!")
-    
-    # Run search for evaluation
-    st.subheader("Run Search for Evaluation")
-    
-    eval_query_id = st.selectbox("Select Query for Evaluation", 
-                                 list(st.session_state.evaluator.relevant_docs.keys()))
-    
-    if eval_query_id:
-        ranking_method = st.selectbox("Ranking Method", ["tfidf", "pagerank", "hits"])
+        with tab1:
+            st.subheader("Relevance judgements")
+            
+            # Display existing judgments
+            if st.session_state.evaluator.relevant_docs:
+                st.write("Existing ground truth:")
+                for qid, rel_docs in st.session_state.evaluator.relevant_docs.items():
+                    qtext = st.session_state.evaluator.query_text.get(qid, qid)
+                    graded = st.session_state.evaluator.graded_relevance.get(qid, {})
+                    st.write(f"**{qid}**: '{qtext}' - {len(rel_docs)} relevant docs (graded: {len(graded)})")
+            
+            # Load bundled judgments
+            if st.button("Load bundled judgments"):
+                for qid, qdata in BUNDLED_QUERIES.items():
+                    st.session_state.evaluator.query_text[qid] = qdata['text']
+                    st.session_state.evaluator.relevant_docs[qid] = set(qdata['relevant_doc_ids'])
+                    if 'graded' in qdata:
+                        st.session_state.evaluator.graded_relevance[qid] = qdata['graded']
+                st.success("Loaded 7 bundled queries with relevance judgments")
+                st.rerun()
+            
+            # Clear all judgments
+            if st.button("Clear all judgments"):
+                st.session_state.evaluator.relevant_docs = {}
+                st.session_state.evaluator.query_text = {}
+                st.session_state.evaluator.graded_relevance = {}
+                st.success("All judgments cleared")
+                st.rerun()
+            
+            # Add custom query
+            st.markdown("---")
+            st.subheader("Add custom query")
+            new_qid = st.text_input("Query ID", "q_custom")
+            new_qtext = st.text_input("Query text", "")
+            
+            if st.session_state.documents:
+                doc_options = document_options()
+                new_rel_docs = st.multiselect("Select relevant documents", range(len(st.session_state.documents)), format_func=lambda x: doc_options[x])
+                
+                if st.button("Save query"):
+                    if new_qid and new_qtext:
+                        st.session_state.evaluator.query_text[new_qid] = new_qtext
+                        st.session_state.evaluator.relevant_docs[new_qid] = set(new_rel_docs)
+                        st.success(f"Query {new_qid} saved")
+                        st.rerun()
         
-        if st.button("Run Search & Evaluate"):
-            # Run search
-            results = st.session_state.search_engine.search(
-                query=eval_query_id.replace('q', ''),  # Simple extraction
-                limit=20,
-                ranking_method=ranking_method
-            )
+        with tab2:
+            st.subheader("Run & compare")
             
-            # Get retrieved document IDs
-            retrieved_ids = [str(i) for i in range(len(results))]
-            st.session_state.evaluator.set_retrieved_documents(eval_query_id, retrieved_ids)
+            # Select ranking methods
+            methods = st.multiselect("Select ranking methods", ["tfidf", "bm25", "pagerank", "hits", "hybrid"], default=["tfidf", "bm25"])
+            result_limit = st.number_input("Result limit", 1, 100, 10)
+            link_weight = st.slider("Link weight", 0.0, 1.0, 0.3, 0.05)
+            use_expansion = st.checkbox("Use query expansion", value=False)
             
-            # Calculate metrics
-            metrics = st.session_state.evaluator.calculate_all_metrics(eval_query_id)
+            if st.button("Run evaluation"):
+                if not st.session_state.evaluator.relevant_docs:
+                    st.warning("No relevance judgments available. Please add queries first.")
+                else:
+                    comparison = []
+                    for method in methods:
+                        method_metrics = {'method': method}
+                        
+                        for qid in st.session_state.evaluator.relevant_docs:
+                            qtext = st.session_state.evaluator.query_text.get(qid, qid)
+                            
+                            # Run search
+                            results = st.session_state.search_engine.search(
+                                query=qtext,
+                                limit=result_limit,
+                                ranking_method=method,
+                                link_weight=link_weight,
+                                expand=use_expansion
+                            )
+                            
+                            # Set retrieved documents
+                            retrieved_ids = [str(i) for i in range(len(results))]
+                            st.session_state.evaluator.set_retrieved_documents(qid, retrieved_ids)
+                            
+                            # Calculate metrics
+                            metrics = st.session_state.evaluator.calculate_all_metrics(qid)
+                            
+                            # Store metrics
+                            for key, value in metrics.items():
+                                if key not in method_metrics:
+                                    method_metrics[key] = []
+                                method_metrics[key].append(value)
+                        
+                        # Average metrics
+                        for key in list(method_metrics.keys()):
+                            if key != 'method' and isinstance(method_metrics[key], list):
+                                method_metrics[key] = np.mean(method_metrics[key])
+                        
+                        comparison.append(method_metrics)
+                    
+                    st.session_state.method_comparison = pd.DataFrame(comparison)
+                    
+                    # Display comparison
+                    st.dataframe(st.session_state.method_comparison, use_container_width=True)
+                    
+                    # Visualize comparison
+                    metrics_to_plot = ['map', 'mrr', 'precision_at_10', 'recall_at_10', 'ndcg_at_10']
+                    for metric in metrics_to_plot:
+                        if metric in st.session_state.method_comparison.columns:
+                            fig = px.bar(st.session_state.method_comparison, x='method', y=metric, title=f"{metric.upper()} by method")
+                            st.plotly_chart(fig, use_container_width=True)
+                    
+                    # Identify best method
+                    if 'map' in st.session_state.method_comparison.columns:
+                        best = st.session_state.method_comparison.loc[st.session_state.method_comparison['map'].idxmax()]
+                        st.success(f"Best method by MAP: {best['method']} (MAP={best['map']:.4f})")
+        
+        with tab3:
+            st.subheader("Per-query analysis")
             
-            st.subheader("Evaluation Metrics")
-            
-            col1, col2, col3 = st.columns(3)
-            
-            with col1:
-                st.metric("Precision", f"{metrics['precision']:.4f}")
-                st.metric("Recall", f"{metrics['recall']:.4f}")
-                st.metric("F1-Score", f"{metrics['f1_score']:.4f}")
-            
-            with col2:
-                st.metric("Average Precision", f"{metrics['average_precision']:.4f}")
-                st.metric("Reciprocal Rank", f"{metrics['reciprocal_rank']:.4f}")
-            
-            with col3:
-                st.metric("Precision@10", f"{metrics['precision_at_10']:.4f}")
-                st.metric("Recall@10", f"{metrics['recall_at_10']:.4f}")
-                st.metric("NDCG@10", f"{metrics['ndcg_at_10']:.4f}")
-            
-            # Precision-Recall Curve
-            st.subheader("Precision-Recall Curve")
-            st.plotly_chart(
-                st.session_state.evaluator.visualize_precision_recall_curve(eval_query_id),
-                use_container_width=True
-            )
+            if st.session_state.evaluator.relevant_docs:
+                query_id = st.selectbox("Select query", list(st.session_state.evaluator.relevant_docs.keys()))
+                method = st.selectbox("Select ranking method", ["tfidf", "bm25", "pagerank", "hits", "hybrid"])
+                
+                if st.button("Analyze"):
+                    qtext = st.session_state.evaluator.query_text.get(query_id, query_id)
+                    
+                    # Run search
+                    results = st.session_state.search_engine.search(
+                        query=qtext,
+                        limit=20,
+                        ranking_method=method
+                    )
+                    
+                    # Set retrieved documents
+                    retrieved_ids = [str(i) for i in range(len(results))]
+                    st.session_state.evaluator.set_retrieved_documents(query_id, retrieved_ids)
+                    
+                    # Calculate metrics
+                    metrics = st.session_state.evaluator.calculate_all_metrics(query_id)
+                    
+                    # Display metrics
+                    col1, col2, col3 = st.columns(3)
+                    col1.metric("Precision", f"{metrics['precision']:.4f}")
+                    col2.metric("Recall", f"{metrics['recall']:.4f}")
+                    col3.metric("F1", f"{metrics['f1_score']:.4f}")
+                    
+                    # Precision-recall curve
+                    st.plotly_chart(st.session_state.evaluator.visualize_precision_recall_curve(query_id), use_container_width=True)
+                    
+                    # NDCG@K
+                    st.plotly_chart(st.session_state.evaluator.visualize_ndcg_at_k(k_values=[5, 10, 20]), use_container_width=True)
+                    
+                    # Retrieved ranking
+                    st.subheader(f"Retrieved ranking for '{qtext}'")
+                    for i, result in enumerate(results, 1):
+                        is_relevant = str(i-1) in st.session_state.evaluator.relevant_docs[query_id]
+                        relevance_mark = "✓" if is_relevant else "✗"
+                        st.write(f"{relevance_mark} {i}. {result.get('title', result.get('url', ''))[:50]} (score: {result.get('score', 0):.4f})")
+            else:
+                st.info("No relevance judgments available.")
 
 # Performance Analytics Page
 elif page == "Performance Analytics":
     st.header("Performance Analytics")
     
-    st.subheader("System-wide Metrics")
+    # Index and collection statistics
+    st.subheader("Index & Collection Statistics")
+    if st.session_state.indexed:
+        stats = st.session_state.search_engine.get_index_statistics()
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Documents indexed", stats['documents_indexed'])
+        col2.metric("Vocabulary size", stats['vocabulary_size'])
+        col3.metric("Postings", stats['posting_entries'])
+        col4.metric("Build time", f"{stats['index_build_seconds']:.2f}s")
     
-    if st.session_state.evaluator.relevant_docs:
-        system_metrics = st.session_state.evaluator.calculate_system_metrics()
-        
+    # Crawl statistics
+    if hasattr(st.session_state.crawler, 'crawl_stats'):
+        st.subheader("Crawl Performance")
+        crawl_stats = st.session_state.crawler.crawl_stats
         col1, col2, col3 = st.columns(3)
+        col1.metric("Pages crawled", crawl_stats.get('pages_crawled', 0))
+        col2.metric("Duplicate URLs", crawl_stats.get('duplicate_urls_skipped', 0))
+        col3.metric("Near-duplicates", crawl_stats.get('near_duplicates', 0))
+    
+    # Query latency benchmark
+    st.markdown("---")
+    st.subheader("Query Latency Benchmark")
+    
+    methods = st.multiselect("Methods to benchmark", ["tfidf", "bm25", "pagerank", "hits", "hybrid"], default=["tfidf", "bm25"])
+    result_sizes = st.multiselect("Result set sizes", [5, 10, 20, 50], default=[10])
+    num_runs = st.number_input("Number of runs per configuration", 1, 10, 3)
+    
+    if st.button("Run benchmark"):
+        benchmark_results = []
+        test_query = "machine learning"
         
-        with col1:
-            st.metric("MAP", f"{system_metrics['map']:.4f}")
-            st.metric("MRR", f"{system_metrics['mrr']:.4f}")
+        for method in methods:
+            for size in result_sizes:
+                latencies = []
+                for _ in range(num_runs):
+                    started = time.perf_counter()
+                    st.session_state.search_engine.search(
+                        query=test_query,
+                        limit=size,
+                        ranking_method=method
+                    )
+                    latencies.append((time.perf_counter() - started) * 1000)
+                
+                benchmark_results.append({
+                    'method': method,
+                    'result_size': size,
+                    'mean_latency_ms': np.mean(latencies),
+                    'std_latency_ms': np.std(latencies),
+                    'min_latency_ms': np.min(latencies),
+                    'max_latency_ms': np.max(latencies)
+                })
         
-        with col2:
-            st.metric("Mean Precision@10", f"{system_metrics['mean_precision_at_10']:.4f}")
-            st.metric("Mean Recall@10", f"{system_metrics['mean_recall_at_10']:.4f}")
+        benchmark_df = pd.DataFrame(benchmark_results)
+        st.dataframe(benchmark_df, use_container_width=True)
         
-        with col3:
-            st.metric("Mean NDCG@10", f"{system_metrics['mean_ndcg_at_10']:.4f}")
+        # Visualize
+        fig = px.box(benchmark_df, x='method', y='mean_latency_ms', color='result_size', title="Latency by method and result size")
+        st.plotly_chart(fig, use_container_width=True)
         
-        # Per-query metrics
-        st.subheader("Per-Query Metrics")
-        metrics_df = st.session_state.evaluator.get_per_query_metrics()
-        st.dataframe(metrics_df, use_container_width=True)
+        fig2 = px.bar(benchmark_df, x='result_size', y='mean_latency_ms', color='method', barmode='group', title="Latency vs result size")
+        st.plotly_chart(fig2, use_container_width=True)
+    
+    # Observed queries
+    st.markdown("---")
+    st.subheader("Observed Queries from Session")
+    
+    if st.session_state.query_log:
+        query_df = pd.DataFrame(st.session_state.query_log)
+        st.dataframe(query_df, use_container_width=True)
         
-        # Metrics visualization
-        st.subheader("Metrics Distribution")
-        st.plotly_chart(
-            st.session_state.evaluator.visualize_metrics_comparison(metrics_df),
-            use_container_width=True
-        )
+        # Latency distribution
+        fig = px.histogram(query_df, x='latency_ms', color='method', title="Query latency distribution")
+        st.plotly_chart(fig, use_container_width=True)
         
-        # NDCG@K comparison
-        st.subheader("NDCG@K Comparison")
-        st.plotly_chart(
-            st.session_state.evaluator.visualize_ndcg_at_k(k_values=[5, 10, 20]),
-            use_container_width=True
-        )
+        # Effectiveness vs efficiency
+        if st.session_state.method_comparison is not None:
+            st.markdown("---")
+            st.subheader("Effectiveness vs Efficiency")
+            
+            # Merge comparison with latency data
+            avg_latency = query_df.groupby('method')['latency_ms'].mean()
+            
+            for _, row in st.session_state.method_comparison.iterrows():
+                method = row['method']
+                if method in avg_latency:
+                    st.write(f"{method}: MAP={row['map']:.4f}, Avg Latency={avg_latency[method]:.2f}ms")
+            
+            # Scatter plot
+            scatter_data = []
+            for _, row in st.session_state.method_comparison.iterrows():
+                method = row['method']
+                if method in avg_latency:
+                    scatter_data.append({
+                        'method': method,
+                        'map': row['map'],
+                        'latency_ms': avg_latency[method]
+                    })
+            
+            if scatter_data:
+                scatter_df = pd.DataFrame(scatter_data)
+                fig = px.scatter(scatter_df, x='latency_ms', y='map', text='method', title="Effectiveness (MAP) vs Efficiency (Latency)")
+                st.plotly_chart(fig, use_container_width=True)
     else:
-        st.info("No evaluation data available. Please add queries and run evaluation first.")
+        st.info("No queries logged yet. Run some searches to see analytics.")
+
+# Inference & Discussion Page
+elif page == "Inference & Discussion":
+    st.header("Inference & Discussion")
+    
+    if st.session_state.method_comparison is None:
+        st.warning("Please run the evaluation dashboard first to generate comparison data.")
+    else:
+        comparison = st.session_state.method_comparison
+        index_stats = st.session_state.search_engine.get_index_statistics() if st.session_state.indexed else {}
+        duplicate_report = st.session_state.crawler.get_duplicate_report() if hasattr(st.session_state.crawler, 'get_duplicate_report') else pd.DataFrame()
+        
+        st.subheader("Discussion based on measured numbers")
+        
+        with st.expander("1. Poor ranking despite relevant retrieval", expanded=True):
+            if comparison is not None and not comparison.empty:
+                best_recall = comparison.loc[comparison["mean_recall_at_10"].idxmax()]
+                best_ndcg = comparison.loc[comparison["mean_ndcg_at_10"].idxmax()]
+                st.markdown(
+                    f"**Measured in this session.** The best mean recall@10 is "
+                    f"{best_recall['mean_recall_at_10']:.3f} ({best_recall['method']}), "
+                    f"while the best mean NDCG@10 is {best_ndcg['mean_ndcg_at_10']:.3f} "
+                    f"({best_ndcg['method']}). High recall with lower NDCG is exactly "
+                    f"the signature of relevant documents being found but ordered badly."
+                )
+            st.markdown(
+                "**Causes.** Term-frequency saturation, so a document that repeats a "
+                "\"query term outranks a better one; no length normalisation, so long "
+                "\"documents accumulate weight; a purely textual score that ignores "
+                "\"document authority; equal weighting of all query terms; and fusing "
+                "\"scores that live on different scales, which lets one component "
+                "\"silently dominate.\n\n"
+                "**Improvements implemented here.** BM25 replaces raw TF-IDF and adds "
+                "\"saturation plus length normalisation; PageRank and HITS supply a "
+                "\"query-independent authority prior; both components are min-"
+                "\"max normalised before the weighted fusion, so the link weight slider has "
+                "\"a predictable effect; pseudo-relevance feedback expands the "
+                "query to \"recover synonym matches; phrase and required-term operators "
+                "promote \"exact intent matches."
+            )
+        
+        with st.expander("2. Effect of duplicate and near-duplicate documents"):
+            if not duplicate_report.empty:
+                near = (duplicate_report["type"] == "near duplicate").sum()
+                exact = (duplicate_report["type"] == "exact duplicate").sum()
+                st.markdown(
+                    f"**Measured in this session.** {exact} exact and {near} near "
+                    f"duplicates were rejected before indexing. The near duplicates "
+                    f"were only caught by shingle similarity: their MD5 hashes differ, "
+                    f"so hashing alone would have admitted them."
+                )
+            st.markdown(
+                "**Indexing.** Duplicates inflate document frequency, which lowers the "
+                "\"IDF of the affected terms and distorts every score that depends on "
+                "\"it; the index also grows without adding information.\n\n"
+                "**Ranking.** Near-identical pages occupy several of the top "
+                "\"positions, crowding out diverse results and wasting the user's attention.\n\n"
+                "**Recommendation.** A near duplicate is the nearest neighbour of its "
+                "\"own original, so the Top-K list degenerates into copies of the "
+                "\"seed document.\n\n"
+                "**Evaluation.** Precision@K is inflated when a duplicate of "
+                "\"a relevant document counts as a second hit, and judgements made on one "
+                "\"copy do not transfer to the other, so scores become unstable.\n\n"
+                "**Mitigation implemented here.** MD5 content hashing removes exact "
+                "\"duplicates; 5-shingle Jaccard similarity above a configurable "
+                "\"threshold removes near duplicates; URL normalisation and a "
+                "\"visited set remove duplicate URLs before fetching."
+            )
+        
+        with st.expander("3. Content-based versus collaborative recommendation"):
+            stats = st.session_state.recommender.get_statistics()
+            st.markdown(
+                f"**Measured in this session.** Ratings cover "
+                f"{stats['rated_documents']} of {stats['total_documents']} d"
+                f"ocuments ({stats['coverage_%']}%) from {stats['users']} users, and the "
+                f"user-item matrix is {stats['matrix_sparsity_%']}% sparse."
+            )
+            st.markdown(
+                "**Content-based** needs only the documents themselves, so it handles "
+                "\"new items immediately (no item cold start), is explainable through "
+                "\"shared terms, and works with no users at all. Its ceiling is the "
+                "\"text: it cannot recommend something that is useful but lexically "
+                "\"different, and it tends to over-specialise on what the user already "
+                "read.\n\n"
+                "**Collaborative** exploits behaviour, so it can surface an "
+                "\"item whose text looks unrelated but which similar users valued, and it "
+                "captures \"quality signals that text cannot express. It fails on cold-"
+                "start items \"and users, and it degrades as the rating matrix becomes "
+                "sparse - \"unrated documents receive a score of exactly zero here.\n\n"
+                "**When to prefer which.** Use content-based for a fresh or "
+                "rapidly \"changing corpus, for niche items with few ratings, and when "
+                "an \"explanation is required. Use collaborative when there is de"
+                "nse \"interaction data and serendipity matters. Use the hybrid to "
+                "get \"coverage from content and preference signal from behaviour, "
+                "which is \"why the hybrid here normalises both components before "
+                "combining them."
+            )
+        
+        with st.expander("4. Value of integrating the whole pipeline"):
+            st.markdown(
+                f"**Measured in this session.** Acquisition produced "
+                f"{len(st.session_state.documents)} de-duplicated documents; "
+                f"preprocessing and indexing turned them into "
+                f"{index_stats.get('vocabulary_size', 0)} features with "
+                f"{index_stats.get('posting_entries', 0)} postings; link "
+                "analysis over "
+                f"{len(st.session_state.url_graph)} nodes reordered results; and "
+                f"evaluation over {len(st.session_state.evaluator.relevant_docs)} judged "
+                f"queries quantified the effect."
+            )
+            st.markdown(
+                "Each stage constrains the quality achievable by the next. C"
+                "rawling \"decides what can ever be found, and its duplicate handling "
+                "protects \"the IDF statistics that ranking depends on. Preprocessing f"
+                "ixes the \"vocabulary, and an over-aggressive setting silently destroy"
+                "s recall - \"raising min_df to 2 on this corpus removed every single-doc"
+                "ument term \"and made those queries return nothing. Indexing determines "
+                "which \"queries are answerable and how fast. Ranking decides what t"
+                "he user \"actually sees out of the candidates. Recommendation reuses "
+                "the same \"document representation to extend a single result into a se"
+                "ssion. \"Evaluation closes the loop by measuring whether any change "
+                "helped, \"which is what makes the improvements above defensible rather "
+                "than \"anecdotal."
+            )
+        
+        with st.expander("5. Learnings from the measured results"):
+            if comparison is not None and not comparison.empty:
+                table = comparison[["method", "map", "mrr", "mean_ndcg_at_10", "avg_latency_ms"]].round(4)
+                st.dataframe(table, use_container_width=True)
+                best = comparison.loc[comparison["map"].idxmax()]
+                textual = comparison[comparison["method"].isin(["tfidf", "bm25"])]
+                st.markdown(
+                    f"- **{best['method']}** achieved the highest MAP "
+                    f"({best['map']:.4f}) in this run.\n"
+                    f"- Adding a link-analysis prior changed the ordering rather "
+                    f"than the candidate set, which is why NDCG moves while recall "
+                    f"stays similar.\n"
+                    f"- Mean query latency stayed at "
+                    f"{comparison['avg_latency_ms'].mean():.2f} ms, so the "
+                    f"effectiveness gains cost essentially nothing at this s"
+                    "cale."
+                )
+                if not textual.empty:
+                    st.markdown(
+                        f"- Purely textual ranking reached a MAP of "
+                        f"{textual['map'].max():.4f}, so link analysis contr"
+                        f"ibuted the remaining difference."
+                    )
+            st.markdown(
+                "- Metrics must compare **document identities**, not rank positions; "
+                "using positions as identifiers produces numbers that look plausible "
+                "but mean nothing.\n"
+                "- Score fusion is only meaningful after normalisation, because "
+                "cosine similarity and PageRank occupy different ranges.\n"
+                "- Aggressive vocabulary pruning is a silent recall bug on small "
+                "collections.\n"
+                "- Exact hashing is insufficient for de-duplication; shingle "
+                "similarity is required to catch paraphrased mirrors.\n"
+                "- Rank-aware measures (NDCG, MRR, MAP) expose ordering problems "
+                "that set-based precision and recall cannot see."
+            )
 
 # Footer
 st.sidebar.markdown("---")
