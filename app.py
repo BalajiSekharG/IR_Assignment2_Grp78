@@ -284,10 +284,10 @@ if page == "Dashboard":
         
         # Load bundled queries for evaluation
         for qid, qdata in BUNDLED_QUERIES.items():
-            st.session_state.evaluator.query_text[qid] = qdata['text']
+            st.session_state.evaluator.query_text[qid] = qdata['query_text']
             st.session_state.evaluator.relevant_docs[qid] = set(qdata['relevant_doc_ids'])
-            if 'graded' in qdata:
-                st.session_state.evaluator.graded_relevance[qid] = qdata['graded']
+            if 'graded_relevance' in qdata:
+                st.session_state.evaluator.graded_relevance[qid] = qdata['graded_relevance']
         
         st.success("Full pipeline completed!")
         st.rerun()
@@ -1013,10 +1013,10 @@ elif page == "Evaluation Dashboard":
             # Load bundled judgments
             if st.button("Load bundled judgments"):
                 for qid, qdata in BUNDLED_QUERIES.items():
-                    st.session_state.evaluator.query_text[qid] = qdata['text']
+                    st.session_state.evaluator.query_text[qid] = qdata['query_text']
                     st.session_state.evaluator.relevant_docs[qid] = set(qdata['relevant_doc_ids'])
-                    if 'graded' in qdata:
-                        st.session_state.evaluator.graded_relevance[qid] = qdata['graded']
+                    if 'graded_relevance' in qdata:
+                        st.session_state.evaluator.graded_relevance[qid] = qdata['graded_relevance']
                 st.success("Loaded 7 bundled queries with relevance judgments")
                 st.rerun()
             
