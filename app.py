@@ -275,22 +275,27 @@ if page == "Dashboard":
     # One-click pipeline
     st.markdown("---")
     st.subheader("One-click Pipeline")
-    if st.button("Run full pipeline with bundled dataset"):
-        load_bundled_dataset(include_near_duplicates=False)
-        run_preprocessing(remove_stops=True, lemmatize=True, stem=False, max_features=None, ngram_max=1)
-        build_index()
-        build_link_graph()
-        build_recommender()
-        
-        # Load bundled queries for evaluation
-        for qid, qdata in BUNDLED_QUERIES.items():
-            st.session_state.evaluator.query_texts[qid] = qdata['query_text']
-            st.session_state.evaluator.relevant_docs[qid] = set(qdata['relevant_doc_ids'])
-            if 'graded_relevance' in qdata:
-                st.session_state.evaluator.graded_relevance[qid] = qdata['graded_relevance']
-        
-        st.success("Full pipeline completed!")
-        st.rerun()
+    
+    # Only show one-click pipeline if no documents are loaded
+    if not st.session_state.documents:
+        if st.button("Run full pipeline with bundled dataset"):
+            load_bundled_dataset(include_near_duplicates=False)
+            run_preprocessing(remove_stops=True, lemmatize=True, stem=False, max_features=None, ngram_max=1)
+            build_index()
+            build_link_graph()
+            build_recommender()
+            
+            # Load bundled queries for evaluation
+            for qid, qdata in BUNDLED_QUERIES.items():
+                st.session_state.evaluator.query_texts[qid] = qdata['query_text']
+                st.session_state.evaluator.relevant_docs[qid] = set(qdata['relevant_doc_ids'])
+                if 'graded_relevance' in qdata:
+                    st.session_state.evaluator.graded_relevance[qid] = qdata['graded_relevance']
+            
+            st.success("Full pipeline completed!")
+            st.rerun()
+    else:
+        st.info("One-click pipeline is only available when no documents are loaded. Use the Data Acquisition page to manage your current collection.")
 
 # Data Acquisition Page
 elif page == "Data Acquisition":
