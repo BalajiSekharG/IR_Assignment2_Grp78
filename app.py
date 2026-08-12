@@ -131,11 +131,13 @@ def load_bundled_dataset(include_near_duplicates=False):
 
 def run_preprocessing(remove_stops, lemmatize, stem, max_features, ngram_max):
     """Run text preprocessing with given parameters."""
-    st.session_state.text_mining.load_documents(st.session_state.documents)
+    st.session_state.text_mining.load_documents(
+        st.session_state.documents,
+        remove_stops=remove_stops,
+        lemmatize_tokens=lemmatize,
+        stem_tokens=stem
+    )
     st.session_state.text_mining.extract_tfidf_features(
-        remove_stopwords=remove_stops,
-        lemmatize=lemmatize,
-        stem=stem,
         max_features=max_features,
         ngram_range=(1, ngram_max)
     )
