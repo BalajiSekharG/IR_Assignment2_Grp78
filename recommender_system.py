@@ -6,19 +6,6 @@ from typing import List, Dict, Tuple
 import plotly.graph_objects as go
 import plotly.express as px
 
-from text_preprocessing import TextPreprocessor, safe_df_bounds
-
-
-def normalize_scores(scores: np.ndarray) -> np.ndarray:
-    """Min-max normalise a score vector onto [0, 1] for fair fusion."""
-    scores = np.asarray(scores, dtype=float)
-    if scores.size == 0:
-        return scores
-    lowest, highest = float(scores.min()), float(scores.max())
-    if highest - lowest < 1e-12:
-        return np.zeros_like(scores)
-    return (scores - lowest) / (highest - lowest)
-
 
 class ContentBasedRecommender:
     def __init__(self):
@@ -26,7 +13,6 @@ class ContentBasedRecommender:
         self.vectorizer = None
         self.documents = []
         self.document_urls = []
-        self.processed_docs = []
         self.similarity_matrix = None
         
     def fit(self, documents: List[Dict], processed_docs: List[str] = None):
@@ -40,24 +26,17 @@ class ContentBasedRecommender:
         self.documents = documents
         self.document_urls = [doc['url'] for doc in documents]
         
-        if processed_docs is None or len(processed_docs) != len(documents):
+        if processed_docs is None:
+            from text_preprocessing import TextPreprocessor
             preprocessor = TextPreprocessor()
             processed_docs = [preprocessor.preprocess_pipeline(doc['content']) for doc in documents]
-        self.processed_docs = processed_docs
         
-        # Create TF-IDF matrix with bounds that are safe for small corpora
-        min_df, max_df = safe_df_bounds(len(processed_docs))
-        self.vectorizer = TfidfVectorizer(max_features=5000, min_df=min_df, max_df=max_df)
+        # Create TF-IDF matrix
+        self.vectorizer = TfidfVectorizer(max_features=5000, min_df=2, max_df=0.8)
         self.tfidf_matrix = self.vectorizer.fit_transform(processed_docs)
         
         # Compute similarity matrix
         self.similarity_matrix = cosine_similarity(self.tfidf_matrix)
-    
-    def content_scores(self, doc_index: int) -> np.ndarray:
-        """Return content similarity of every document to the given document."""
-        if self.similarity_matrix is None or doc_index >= len(self.documents):
-            return np.zeros(len(self.documents))
-        return np.asarray(self.similarity_matrix[doc_index], dtype=float)
     
     def recommend(self, doc_index: int, top_k: int = 5) -> List[Dict]:
         """
@@ -76,18 +55,15 @@ class ContentBasedRecommender:
         # Get similarity scores for the query document
         sim_scores = self.similarity_matrix[doc_index]
         
-        # Rank all other documents, always excluding the query document itself
-        candidates = [i for i in sim_scores.argsort()[::-1] if i != doc_index]
-        top_indices = candidates[:top_k]
+        # Get indices of top-k similar documents (excluding the query itself)
+        top_indices = sim_scores.argsort()[::-1][1:top_k + 1]
         
         recommendations = []
         for idx in top_indices:
             recommendations.append({
-                'doc_id': int(idx),
                 'url': self.document_urls[idx],
                 'title': self.documents[idx].get('title', ''),
-                'similarity_score': float(sim_scores[idx]),
-                'approach': 'content',
+                'similarity_score': sim_scores[idx],
                 'content_preview': self.documents[idx]['content'][:200] + '...' if len(self.documents[idx]['content']) > 200 else self.documents[idx]['content']
             })
         
@@ -104,32 +80,21 @@ class ContentBasedRecommender:
         Returns:
             List of recommendations with similarity scores
         """
-        if self.vectorizer is None:
-            return []
-        
-        # The query must go through the same preprocessing as the documents,
-        # otherwise raw query tokens will not match the indexed vocabulary.
-        preprocessor = TextPreprocessor()
-        processed_query = preprocessor.preprocess_pipeline(query)
-        if not processed_query.strip():
-            return []
-        
-        query_vector = self.vectorizer.transform([processed_query])
+        # Transform query using the same vectorizer
+        query_vector = self.vectorizer.transform([query])
         
         # Compute similarity with all documents
         sim_scores = cosine_similarity(query_vector, self.tfidf_matrix)[0]
         
         # Get indices of top-k similar documents
-        top_indices = [i for i in sim_scores.argsort()[::-1] if sim_scores[i] > 0][:top_k]
+        top_indices = sim_scores.argsort()[::-1][:top_k]
         
         recommendations = []
         for idx in top_indices:
             recommendations.append({
-                'doc_id': int(idx),
                 'url': self.document_urls[idx],
                 'title': self.documents[idx].get('title', ''),
-                'similarity_score': float(sim_scores[idx]),
-                'approach': 'content',
+                'similarity_score': sim_scores[idx],
                 'content_preview': self.documents[idx]['content'][:200] + '...' if len(self.documents[idx]['content']) > 200 else self.documents[idx]['content']
             })
         
@@ -161,8 +126,6 @@ class CollaborativeRecommender:
         self.item_similarity = None
         self.users = []
         self.items = []
-        self.item_positions = {}
-        self.ratings_data = []
         
     def fit(self, ratings_data: List[Dict]):
         """
@@ -171,10 +134,6 @@ class CollaborativeRecommender:
         Args:
             ratings_data: List of dictionaries with 'user_id', 'item_id', 'rating'
         """
-        if not ratings_data:
-            return
-        
-        self.ratings_data = ratings_data
         df = pd.DataFrame(ratings_data)
         
         # Create user-item matrix
@@ -187,98 +146,12 @@ class CollaborativeRecommender:
         
         self.users = self.user_item_matrix.index.tolist()
         self.items = self.user_item_matrix.columns.tolist()
-        self.item_positions = {item: i for i, item in enumerate(self.items)}
         
         # Compute user-user similarity
         self.user_similarity = cosine_similarity(self.user_item_matrix)
         
         # Compute item-item similarity
         self.item_similarity = cosine_similarity(self.user_item_matrix.T)
-    
-    def is_fitted(self) -> bool:
-        """Whether any ratings were supplied."""
-        return self.user_item_matrix is not None and len(self.items) > 0
-    
-    def item_scores_for_documents(self, item_id: str, document_urls: List[str]) -> np.ndarray:
-        """Return the item-item collaborative score of every document.
-
-        The score of document *d* is the co-rating similarity between *d* and
-        the query item, i.e. "users who liked this also liked that". Documents
-        that nobody rated receive a score of zero, which is exactly the cold
-        start weakness of collaborative filtering.
-        """
-        scores = np.zeros(len(document_urls), dtype=float)
-        if not self.is_fitted():
-            return scores
-        
-        query_position = self.item_positions.get(item_id)
-        if query_position is None:
-            return scores
-        
-        for i, url in enumerate(document_urls):
-            position = self.item_positions.get(url)
-            if position is not None and position != query_position:
-                scores[i] = float(self.item_similarity[query_position, position])
-        return scores
-    
-    def recommend_similar_items(self, item_id: str, top_k: int = 5) -> List[Dict]:
-        """Recommend items co-rated with the given item (item-based CF)."""
-        if not self.is_fitted():
-            return []
-        
-        query_position = self.item_positions.get(item_id)
-        if query_position is None:
-            return []
-        
-        similarities = self.item_similarity[query_position]
-        order = [i for i in similarities.argsort()[::-1]
-                  if i != query_position and similarities[i] > 0][:top_k]
-        
-        return [
-            {
-                'item_id': self.items[i],
-                'url': self.items[i],
-                'similarity_score': float(similarities[i]),
-                'approach': 'collaborative'
-            }
-            for i in order
-        ]
-    
-    def get_coverage(self, document_urls: List[str]) -> Dict:
-        """Report how much of the collection the ratings actually cover."""
-        if not self.is_fitted():
-            return {'rated_documents': 0, 'total_documents': len(document_urls),
-                    'coverage_%': 0.0, 'users': 0, 'ratings': 0,
-                    'matrix_sparsity_%': 100.0}
-        
-        rated = sum(1 for url in document_urls if url in self.item_positions)
-        cells = self.user_item_matrix.size
-        non_zero = int((self.user_item_matrix.values > 0).sum())
-        return {
-            'rated_documents': rated,
-            'total_documents': len(document_urls),
-            'coverage_%': round(100 * rated / len(document_urls), 1) if document_urls else 0.0,
-            'users': len(self.users),
-            'ratings': non_zero,
-            'matrix_sparsity_%': round(100 * (1 - non_zero / cells), 1) if cells else 100.0
-        }
-    
-    def visualize_user_item_matrix(self) -> go.Figure:
-        """Visualize the user-item rating matrix."""
-        if not self.is_fitted():
-            return go.Figure(layout=go.Layout(title='No ratings data available'))
-        
-        short_items = [item.split('/')[-1][:28] for item in self.items]
-        fig = px.imshow(
-            self.user_item_matrix.values,
-            x=short_items,
-            y=self.users,
-            color_continuous_scale='Blues',
-            labels={'x': 'Item', 'y': 'User', 'color': 'Rating'},
-            title='User-Item Rating Matrix (0 = not rated)'
-        )
-        fig.update_layout(xaxis_tickangle=-45)
-        return fig
     
     def recommend_user_based(self, user_id: str, top_k: int = 5) -> List[Dict]:
         """
@@ -323,10 +196,7 @@ class CollaborativeRecommender:
                 predicted_rating = weighted_sum / similarity_sum
                 recommendations.append({
                     'item_id': item,
-                    'url': item,
-                    'predicted_rating': predicted_rating,
-                    'similarity_score': predicted_rating,
-                    'approach': 'collaborative_user_based'
+                    'predicted_rating': predicted_rating
                 })
         
         # Sort by predicted rating and return top-k
@@ -374,10 +244,7 @@ class CollaborativeRecommender:
                 predicted_rating = weighted_sum / similarity_sum
                 recommendations.append({
                     'item_id': item,
-                    'url': item,
-                    'predicted_rating': predicted_rating,
-                    'similarity_score': predicted_rating,
-                    'approach': 'collaborative_item_based'
+                    'predicted_rating': predicted_rating
                 })
         
         # Sort by predicted rating and return top-k
@@ -410,66 +277,62 @@ class HybridRecommender:
         if ratings_data:
             self.collaborative_recommender.fit(ratings_data)
     
-    def has_collaborative_signal(self) -> bool:
-        """Whether a usable collaborative component was fitted."""
-        return self.collaborative_recommender.is_fitted()
-    
     def recommend(self, doc_index: int, top_k: int = 5, 
                   content_weight: float = 0.7, collab_weight: float = 0.3) -> List[Dict]:
         """
-        Recommend using a genuine hybrid of content and collaborative signals.
-
-        Both components are computed over the whole collection and min-max
-        normalised before the weighted sum, so the collaborative signal really
-        changes the ordering instead of being a cosmetic zero column.
-
+        Recommend using hybrid approach.
+        
         Args:
             doc_index: Index of query document
             top_k: Number of recommendations
             content_weight: Weight for content-based scores
             collab_weight: Weight for collaborative scores
-
+        
         Returns:
-            List of hybrid recommendations with per-component contributions
+            List of hybrid recommendations
         """
-        if not self.documents or doc_index >= len(self.documents):
-            return []
-
-        document_urls = [doc['url'] for doc in self.documents]
-        query_url = document_urls[doc_index]
-
-        content_scores = self.content_recommender.content_scores(doc_index)
-        collab_scores = self.collaborative_recommender.item_scores_for_documents(
-            query_url, document_urls)
-
-        # Renormalise the weights when no ratings are available, so the hybrid
-        # degrades gracefully to pure content-based instead of shrinking scores.
-        if not self.has_collaborative_signal() or collab_scores.max() <= 0:
-            content_weight, collab_weight = 1.0, 0.0
-
-        normalized_content = normalize_scores(content_scores)
-        normalized_collab = normalize_scores(collab_scores)
-        combined = content_weight * normalized_content + collab_weight * normalized_collab
-
-        combined[doc_index] = -1.0  # never recommend the query document
-        order = [i for i in combined.argsort()[::-1] if combined[i] > 0][:top_k]
-
+        # Get content-based recommendations
+        content_recs = self.content_recommender.recommend(doc_index, top_k * 2)
+        
+        # Create a dictionary to store combined scores
+        combined_scores = {}
+        
+        # Add content-based scores
+        for rec in content_recs:
+            url = rec['url']
+            combined_scores[url] = {
+                'url': url,
+                'title': rec['title'],
+                'content_score': rec['similarity_score'],
+                'collab_score': 0,
+                'combined_score': rec['similarity_score'] * content_weight
+            }
+        
+        # Normalize and combine scores
+        max_content = max([r['content_score'] for r in combined_scores.values()]) if combined_scores else 1
+        
+        for url, rec_data in combined_scores.items():
+            rec_data['content_score'] = rec_data['content_score'] / max_content
+            rec_data['combined_score'] = rec_data['content_score'] * content_weight
+        
+        # Sort by combined score
+        sorted_recs = sorted(combined_scores.values(), key=lambda x: x['combined_score'], reverse=True)
+        
+        # Format output
         recommendations = []
-        for index in order:
-            doc = self.documents[index]
-            recommendations.append({
-                'doc_id': int(index),
-                'url': doc['url'],
-                'title': doc.get('title', ''),
-                'similarity_score': float(combined[index]),
-                'content_score': float(content_scores[index]),
-                'collab_score': float(collab_scores[index]),
-                'content_contribution': float(content_weight * normalized_content[index]),
-                'collab_contribution': float(collab_weight * normalized_collab[index]),
-                'approach': 'hybrid',
-                'content_preview': doc['content'][:200] + '...' if len(doc['content']) > 200 else doc['content']
-            })
-
+        for rec in sorted_recs[:top_k]:
+            # Find original document
+            doc = next((d for d in self.documents if d['url'] == rec['url']), None)
+            if doc:
+                recommendations.append({
+                    'url': rec['url'],
+                    'title': rec['title'],
+                    'similarity_score': rec['combined_score'],
+                    'content_contribution': rec['content_score'] * content_weight,
+                    'collab_contribution': rec['collab_score'] * collab_weight,
+                    'content_preview': doc['content'][:200] + '...' if len(doc['content']) > 200 else doc['content']
+                })
+        
         return recommendations
     
     def visualize_hybrid_recommendations(self, recommendations: List[Dict]) -> go.Figure:
@@ -512,19 +375,12 @@ class RecommenderSystem:
         self.collaborative = CollaborativeRecommender()
         self.hybrid = HybridRecommender()
         self.approach = 'content'
-        self.documents = []
-        self.ratings_data = []
-        self.fitted_signature = None
         
     def fit(self, documents: List[Dict], processed_docs: List[str] = None,
             ratings_data: List[Dict] = None, approach: str = 'content'):
         """
         Fit the recommender system.
-
-        All three sub-models are fitted whenever the data is available, which
-        makes it possible to compare the approaches side by side without
-        refitting.
-
+        
         Args:
             documents: List of document dictionaries
             processed_docs: Preprocessed documents
@@ -532,123 +388,58 @@ class RecommenderSystem:
             approach: 'content', 'collaborative', or 'hybrid'
         """
         self.approach = approach
-        self.documents = documents
-        self.ratings_data = ratings_data or []
-
-        self.content_based.fit(documents, processed_docs)
-        if ratings_data:
-            self.collaborative.fit(ratings_data)
-        self.hybrid.fit(documents, processed_docs, ratings_data)
-
-        # Signature lets the UI skip an expensive refit on every rerun.
-        self.fitted_signature = (len(documents), len(self.ratings_data),
-                                documents[0]['url'] if documents else None)
-
-    def needs_fit(self, documents: List[Dict], ratings_data: List[Dict] = None) -> bool:
-        """Whether the model must be refitted for this data."""
-        signature = (len(documents), len(ratings_data or []),
-                    documents[0]['url'] if documents else None)
-        return signature != self.fitted_signature
+        
+        if approach == 'content':
+            self.content_based.fit(documents, processed_docs)
+        elif approach == 'collaborative':
+            if ratings_data:
+                self.collaborative.fit(ratings_data)
+        elif approach == 'hybrid':
+            self.hybrid.fit(documents, processed_docs, ratings_data)
     
     def recommend(self, doc_index: int = None, query: str = None, 
-                  user_id: str = None, top_k: int = 5,
-                  content_weight: float = 0.7,
-                  collab_weight: float = 0.3) -> List[Dict]:
+                  user_id: str = None, top_k: int = 5) -> List[Dict]:
         """
-        Generate recommendations for the currently selected approach.
-
+        Generate recommendations.
+        
         Args:
-            doc_index: Index of document (content, collaborative item-based, hybrid)
-            query: Text query (content-based only)
-            user_id: User ID (collaborative user-based)
+            doc_index: Index of document for content-based
+            query: Text query for content-based
+            user_id: User ID for collaborative filtering
             top_k: Number of recommendations
-            content_weight: Content weight for the hybrid approach
-            collab_weight: Collaborative weight for the hybrid approach
-
+        
         Returns:
             List of recommendations
         """
         if self.approach == 'content':
             if query:
                 return self.content_based.recommend_by_query(query, top_k)
-            if doc_index is not None:
+            elif doc_index is not None:
                 return self.content_based.recommend(doc_index, top_k)
         elif self.approach == 'collaborative':
             if user_id:
                 return self.collaborative.recommend_user_based(user_id, top_k)
-            if doc_index is not None and doc_index < len(self.documents):
-                return self.collaborative.recommend_similar_items(
-                    self.documents[doc_index]['url'], top_k)
         elif self.approach == 'hybrid':
             if doc_index is not None:
-                return self.hybrid.recommend(doc_index, top_k,
-                                                 content_weight=content_weight,
-                                                 collab_weight=collab_weight)
-
+                return self.hybrid.recommend(doc_index, top_k)
+        
         return []
-    
-    def compare_approaches(self, doc_index: int, top_k: int = 5) -> pd.DataFrame:
-        """Compare content-based, collaborative and hybrid Top-K side by side.
-
-        Directly supports the required discussion of when each approach is
-        preferable: content-based always returns results, collaborative only
-        covers rated items, and the hybrid inherits the strengths of both.
-        """
-        if not self.documents or doc_index >= len(self.documents):
-            return pd.DataFrame()
-
-        query_url = self.documents[doc_index]['url']
-        content = self.content_based.recommend(doc_index, top_k)
-        collaborative = self.collaborative.recommend_similar_items(query_url, top_k)
-        hybrid = self.hybrid.recommend(doc_index, top_k)
-
-        rows = []
-        for rank in range(top_k):
-            rows.append({
-                'rank': rank + 1,
-                'content_based': content[rank]['url'].split('/')[-1] if rank < len(content) else '-',
-                'content_score': round(content[rank]['similarity_score'], 4) if rank < len(content) else None,
-                'collaborative': collaborative[rank]['url'].split('/')[-1] if rank < len(collaborative) else '-',
-                'collab_score': round(collaborative[rank]['similarity_score'], 4) if rank < len(collaborative) else None,
-                'hybrid': hybrid[rank]['url'].split('/')[-1] if rank < len(hybrid) else '-',
-                'hybrid_score': round(hybrid[rank]['similarity_score'], 4) if rank < len(hybrid) else None,
-            })
-        return pd.DataFrame(rows)
-    
-    def get_statistics(self) -> Dict:
-        """Return descriptive statistics about the fitted recommenders."""
-        document_urls = [doc['url'] for doc in self.documents]
-        stats = {
-            'approach': self.approach,
-            'documents': len(self.documents),
-            'content_features': self.content_based.tfidf_matrix.shape[1]
-            if self.content_based.tfidf_matrix is not None else 0,
-            'collaborative_available': self.collaborative.is_fitted()
-        }
-        stats.update(self.collaborative.get_coverage(document_urls))
-        return stats
     
     def visualize_recommendations(self, recommendations: List[Dict]) -> go.Figure:
         """Visualize recommendations based on approach."""
-        if not recommendations:
-            return go.Figure(layout=go.Layout(title='No recommendations to display'))
-
-        if self.approach == 'hybrid' and 'content_contribution' in recommendations[0]:
+        if self.approach == 'content':
+            return self.content_based.visualize_recommendations(recommendations)
+        elif self.approach == 'hybrid':
             return self.hybrid.visualize_hybrid_recommendations(recommendations)
-
-        labels = [
-            (rec.get('url') or rec.get('item_id', ''))
-            for rec in recommendations
-        ]
-        labels = [label.split('/')[-1][:40] for label in labels]
-        scores = [rec.get('similarity_score', rec.get('predicted_rating', 0))
-                  for rec in recommendations]
-
-        fig = px.bar(
-            x=labels,
-            y=scores,
-            title=f'Top-{len(recommendations)} Recommendations ({self.approach})',
-            labels={'x': 'Recommended item', 'y': 'Score'}
-        )
-        fig.update_layout(xaxis_tickangle=-45)
-        return fig
+        else:
+            # Simple bar chart for collaborative
+            items = [rec['item_id'] for rec in recommendations]
+            ratings = [rec['predicted_rating'] for rec in recommendations]
+            
+            fig = px.bar(
+                x=list(items),
+                y=list(ratings),
+                title='Collaborative Filtering Recommendations',
+                labels={'x': 'Item ID', 'y': 'Predicted Rating'}
+            )
+            return fig
