@@ -383,3 +383,13 @@ def _get_queries() -> list:
             "graded_relevance": {18: 2, 19: 1, 20: 1, 21: 2, 22: 2, 23: 2},
         },
     ]
+
+
+# Module-level constants for direct import
+_dataset = get_dataset()
+BUNDLED_DATASET = _dataset["documents"]
+BUNDLED_METADATA = _dataset["metadata"]
+BUNDLED_URL_GRAPH = _dataset["url_graph"]
+BUNDLED_LABELS = _dataset["labels"]
+BUNDLED_RATINGS = _dataset["ratings"]
+BUNDLED_QUERIES = {q["query_id"]: q for q in _dataset["queries"]}
